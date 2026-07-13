@@ -109,15 +109,15 @@ class ObservationsCfg:
             params={
                 "robot_cfg": SceneEntityCfg("robot"),
                 "ee_frame_cfg": SceneEntityCfg("ee_frame"),
-                "object_cfg": SceneEntityCfg("cube_2"),
+                "object_cfg": SceneEntityCfg("cube_1"), #was cube_2
             },
         )
         stack_1 = ObsTerm(
             func=mdp.object_stacked,
             params={
                 "robot_cfg": SceneEntityCfg("robot"),
-                "upper_object_cfg": SceneEntityCfg("cube_2"),
-                "lower_object_cfg": SceneEntityCfg("cube_1"),
+                "upper_object_cfg": SceneEntityCfg("cube_1"), #was cube_2
+                "lower_object_cfg": SceneEntityCfg("cube_2"), #was cube_1
             },
         )
         grasp_2 = ObsTerm(

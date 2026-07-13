@@ -204,6 +204,7 @@ def create_environment_config(
     # parse configuration
     try:
         env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
+        #print("env_cfg, ", env_cfg)
         env_cfg.env_name = args_cli.task.split(":")[-1]
     except Exception as e:
         logger.error(f"Failed to parse environment configuration: {e}")
@@ -213,6 +214,7 @@ def create_environment_config(
     success_term = None
     if hasattr(env_cfg.terminations, "success"):
         success_term = env_cfg.terminations.success
+        #print("success_term, ", success_term)
         env_cfg.terminations.success = None
     else:
         logger.warning(
@@ -351,6 +353,8 @@ def process_success_condition(env: gym.Env, success_term: object | None, success
     if success_term is None:
         return success_step_count, False
 
+    print("success bool, ", bool(success_term.func(env, **success_term.params)[0]))
+
     if bool(success_term.func(env, **success_term.params)[0]):
         success_step_count += 1
         if success_step_count >= args_cli.num_success_steps:
@@ -464,14 +468,31 @@ def run_simulation_loop(
             actions = action.repeat(env.num_envs, 1)
 
             # Perform action on environment
+            # if running_recording_instance:
+            #     # Compute actions based on environment
+            #     obv = env.step(actions)
+            #     if subtasks is not None:
+            #         if subtasks == {}:
+            #             subtasks = obv[0].get("subtask_terms")
+            #             print("True or False? ", obv[0]["subtask_terms"])
+            #         elif subtasks:
+            #             show_subtask_instructions(instruction_display, subtasks, obv, env.cfg)
+
             if running_recording_instance:
-                # Compute actions based on environment
                 obv = env.step(actions)
-                if subtasks is not None:
+
+                if "subtask_terms" in obv[0]:
+                    #print(obv[0]["subtask_terms"])
+
                     if subtasks == {}:
-                        subtasks = obv[0].get("subtask_terms")
-                    elif subtasks:
-                        show_subtask_instructions(instruction_display, subtasks, obv, env.cfg)
+                        subtasks = obv[0]["subtask_terms"]
+                    else:
+                        show_subtask_instructions(
+                            instruction_display,
+                            subtasks,
+                            obv,
+                            env.cfg
+                        )
             else:
                 env.sim.render()
 
