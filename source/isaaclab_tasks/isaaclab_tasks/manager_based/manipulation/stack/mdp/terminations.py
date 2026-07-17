@@ -52,39 +52,43 @@ def cubes_stacked(
     # Check cube positions
     stacked = xy_dist_c12 < xy_threshold
     stacked = torch.logical_and(h_dist_c12 - height_diff < height_threshold, stacked)
-    # stacked = torch.logical_and(pos_diff_c12[:, 2] < 0.0, stacked)
-    stacked = torch.logical_and(pos_diff_c12[:, 2] > 0.0, stacked)
+    # NOTE: yuna - for original ID, use the very bottom, if not (OOD; created), use the one below that
+
+    stacked = torch.logical_and(pos_diff_c12[:, 2] < 0.0, stacked)
+    # stacked = torch.logical_and(pos_diff_c12[:, 2] > 0.0, stacked)
 
     if cube_3_cfg is not None:
         cube_3: RigidObject = env.scene[cube_3_cfg.name]
 
         #### SECOND COMPARISON
+        # NOTE: yuna - for original ID, use the very bottom, if not (OOD; created), use the one below that
 
-        # pos_diff_c23 = cube_2.data.root_pos_w - cube_3.data.root_pos_w
 
-        # # Compute cube position difference in x-y plane
-        # xy_dist_c23 = torch.norm(pos_diff_c23[:, :2], dim=1)
-
-        # # Compute cube height difference
-        # h_dist_c23 = torch.norm(pos_diff_c23[:, 2:], dim=1)
-
-        # # Check cube positions
-        # stacked = torch.logical_and(xy_dist_c23 < xy_threshold, stacked)
-        # stacked = torch.logical_and(h_dist_c23 - height_diff < height_threshold, stacked)
-        # stacked = torch.logical_and(pos_diff_c23[:, 2] < 0.0, stacked)
-
-        pos_diff_c13 = cube_1.data.root_pos_w - cube_3.data.root_pos_w
+        pos_diff_c23 = cube_2.data.root_pos_w - cube_3.data.root_pos_w
 
         # Compute cube position difference in x-y plane
-        xy_dist_c13 = torch.norm(pos_diff_c13[:, :2], dim=1)
+        xy_dist_c23 = torch.norm(pos_diff_c23[:, :2], dim=1)
 
         # Compute cube height difference
-        h_dist_c13 = torch.norm(pos_diff_c13[:, 2:], dim=1)
+        h_dist_c23 = torch.norm(pos_diff_c23[:, 2:], dim=1)
 
         # Check cube positions
-        stacked = torch.logical_and(xy_dist_c13 < xy_threshold, stacked)
-        stacked = torch.logical_and(h_dist_c13 - height_diff < height_threshold, stacked)
-        stacked = torch.logical_and(pos_diff_c13[:, 2] < 0.0, stacked)
+        stacked = torch.logical_and(xy_dist_c23 < xy_threshold, stacked)
+        stacked = torch.logical_and(h_dist_c23 - height_diff < height_threshold, stacked)
+        stacked = torch.logical_and(pos_diff_c23[:, 2] < 0.0, stacked)
+
+        # pos_diff_c13 = cube_1.data.root_pos_w - cube_3.data.root_pos_w
+
+        # # Compute cube position difference in x-y plane
+        # xy_dist_c13 = torch.norm(pos_diff_c13[:, :2], dim=1)
+
+        # # Compute cube height difference
+        # h_dist_c13 = torch.norm(pos_diff_c13[:, 2:], dim=1)
+
+        # # Check cube positions
+        # stacked = torch.logical_and(xy_dist_c13 < xy_threshold, stacked)
+        # stacked = torch.logical_and(h_dist_c13 - height_diff < height_threshold, stacked)
+        # stacked = torch.logical_and(pos_diff_c13[:, 2] < 0.0, stacked)
 
     # Check gripper positions
     if hasattr(env.scene, "surface_grippers") and len(env.scene.surface_grippers) > 0:

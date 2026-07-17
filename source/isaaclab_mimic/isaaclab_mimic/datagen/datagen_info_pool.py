@@ -53,6 +53,8 @@ class DataGenInfoPool:
                 subtask_config.subtask_term_offset_range for subtask_config in eef_subtask_configs
             ]
 
+        print("self.subtask_term_signal_names, ", self.subtask_term_signal_names)
+
     @property
     def datagen_infos(self):
         """Returns the datagen infos."""
@@ -99,12 +101,15 @@ class DataGenInfoPool:
         """
         ep_grp = episode.data
 
+        #print("ep_grp, ", ep_grp)
+
         # Extract datagen info
         if "datagen_info" in ep_grp["obs"]:
             eef_pose = ep_grp["obs"]["datagen_info"]["eef_pose"]
             object_poses_dict = ep_grp["obs"]["datagen_info"]["object_pose"]
             target_eef_pose = ep_grp["obs"]["datagen_info"]["target_eef_pose"]
             subtask_term_signals_dict = ep_grp["obs"]["datagen_info"]["subtask_term_signals"]
+            print("subtask_term_signals_dict, ", subtask_term_signals_dict)
             # subtask_start_signals is optional
             subtask_start_signals_dict = ep_grp["obs"]["datagen_info"].get("subtask_start_signals")
         else:

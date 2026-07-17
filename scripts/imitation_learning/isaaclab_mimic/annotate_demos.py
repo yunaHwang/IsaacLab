@@ -296,6 +296,10 @@ def main():
                 print(f"\nAnnotating episode #{episode_index} ({episode_name})")
                 episode = dataset_file_handler.load_episode(episode_name, env.device)
 
+                # # NOTE: yuna-added <check episode structure>
+                # ep_grp = episode.data
+                # subtask_term_signals_dict = ep_grp["obs"]["datagen_info"]["subtask_term_signals"]
+
                 is_episode_annotated_successfully = False
                 if args_cli.auto:
                     is_episode_annotated_successfully = annotate_episode_in_auto_mode(env, episode, success_term)
@@ -408,8 +412,10 @@ def annotate_episode_in_auto_mode(
         # check if all the subtask term signals are annotated
         annotated_episode = env.recorder_manager.get_episode(0)
         subtask_term_signal_dict = annotated_episode.data["obs"]["datagen_info"]["subtask_term_signals"]
+        print("subtask_term_signal_dict keys, ", subtask_term_signal_dict.keys())
         for signal_name, signal_flags in subtask_term_signal_dict.items():
             signal_flags = torch.tensor(signal_flags, device=env.device)
+            print("signal_name, signal_flags, ", signal_name, signal_flags)
             if not torch.any(signal_flags):
                 is_episode_annotated_successfully = False
                 print(f'\tDid not detect completion for the subtask "{signal_name}".')

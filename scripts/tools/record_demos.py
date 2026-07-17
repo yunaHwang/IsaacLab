@@ -471,6 +471,7 @@ def run_simulation_loop(
             # if running_recording_instance:
             #     # Compute actions based on environment
             #     obv = env.step(actions)
+            #     #print("obv, ", obv[0])
             #     if subtasks is not None:
             #         if subtasks == {}:
             #             subtasks = obv[0].get("subtask_terms")
@@ -482,7 +483,7 @@ def run_simulation_loop(
                 obv = env.step(actions)
 
                 if "subtask_terms" in obv[0]:
-                    #print(obv[0]["subtask_terms"])
+                    print(obv[0]["subtask_terms"])
 
                     if subtasks == {}:
                         subtasks = obv[0]["subtask_terms"]

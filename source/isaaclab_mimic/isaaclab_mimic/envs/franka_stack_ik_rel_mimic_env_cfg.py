@@ -35,16 +35,18 @@ class FrankaCubeStackIKRelMimicEnvCfg(FrankaCubeStackEnvCfg, MimicEnvCfg):
         self.datagen_config.seed = 1
 
         # The following are the subtask configurations for the stack task.
+
+        # NOTE: yuna - for original ID, use the very bottom, if not (OOD; created), use the one below that
         subtask_configs = []
         subtask_configs.append(
             SubTaskConfig(
                 # Each subtask involves manipulation with respect to a single object frame.
-                # object_ref="cube_2",
-                object_ref="cube_1",
+                object_ref="cube_2",
+                # object_ref="cube_1",
                 # This key corresponds to the binary indicator in "datagen_info" that signals
                 # when this subtask is finished (e.g., on a 0 to 1 edge).
-                # subtask_term_signal="grasp_1",
-                subtask_term_signal="grasp_2",
+                subtask_term_signal="grasp_1",
+                # subtask_term_signal="grasp_2",
                 # Specifies time offsets for data generation when splitting a trajectory into
                 # subtask segments. Random offsets are added to the termination boundary.
                 subtask_term_offset_range=(10, 20),
@@ -60,20 +62,20 @@ class FrankaCubeStackIKRelMimicEnvCfg(FrankaCubeStackEnvCfg, MimicEnvCfg):
                 num_fixed_steps=0,
                 # If True, apply action noise during the interpolation phase and execution
                 apply_noise_during_interpolation=False,
-                #description="Grasp red cube",
-                description="Grasp blue cube", 
-                # next_subtask_description="Stack red cube on top of blue cube",
-                next_subtask_description="Stack blue cube on top of red cube",
+                description="Grasp red cube",
+                # description="Grasp blue cube", 
+                next_subtask_description="Stack red cube on top of blue cube",
+                # next_subtask_description="Stack blue cube on top of red cube",
             )
         )
         subtask_configs.append(
             SubTaskConfig(
                 # Each subtask involves manipulation with respect to a single object frame.
-                # object_ref="cube_1",
-                object_ref="cube_2",
+                object_ref="cube_1",
+                # object_ref="cube_2",
                 # Corresponding key for the binary indicator in "datagen_info" for completion
-                # subtask_term_signal="stack_1",
-                subtask_term_signal="stack_2",
+                subtask_term_signal="stack_1",
+                # subtask_term_signal="stack_2",
                 # Time offsets for data generation when splitting a trajectory
                 subtask_term_offset_range=(10, 20),
                 # Selection strategy for source subtask segment
@@ -96,8 +98,8 @@ class FrankaCubeStackIKRelMimicEnvCfg(FrankaCubeStackEnvCfg, MimicEnvCfg):
                 # Each subtask involves manipulation with respect to a single object frame.
                 object_ref="cube_3",
                 # Corresponding key for the binary indicator in "datagen_info" for completion
-                # subtask_term_signal="grasp_2",
-                subtask_term_signal="grasp_1",
+                subtask_term_signal="grasp_2",
+                # subtask_term_signal="grasp_1",
                 # Time offsets for data generation when splitting a trajectory
                 subtask_term_offset_range=(10, 20),
                 # Selection strategy for source subtask segment
@@ -112,15 +114,15 @@ class FrankaCubeStackIKRelMimicEnvCfg(FrankaCubeStackEnvCfg, MimicEnvCfg):
                 num_fixed_steps=0,
                 # If True, apply action noise during the interpolation phase and execution
                 apply_noise_during_interpolation=False,
-                # next_subtask_description="Stack green cube on top of red cube",
-                next_subtask_description="Stack green cube on top of blue cube",
+                next_subtask_description="Stack green cube on top of red cube",
+                # next_subtask_description="Stack green cube on top of blue cube",
             )
         )
         subtask_configs.append(
             SubTaskConfig(
                 # Each subtask involves manipulation with respect to a single object frame.
-                # object_ref="cube_2",
-                object_ref="cube_1",
+                object_ref="cube_2",
+                # object_ref="cube_1",
                 # End of final subtask does not need to be detected
                 subtask_term_signal=None,
                 # No time offsets for the final subtask
@@ -140,3 +142,112 @@ class FrankaCubeStackIKRelMimicEnvCfg(FrankaCubeStackEnvCfg, MimicEnvCfg):
             )
         )
         self.subtask_configs["franka"] = subtask_configs
+
+
+
+        # THIS is the OOD
+        # subtask_configs = []
+        # subtask_configs.append(
+        #     SubTaskConfig(
+        #         # Each subtask involves manipulation with respect to a single object frame.
+        #         # object_ref="cube_2",
+        #         object_ref="cube_1",
+        #         # This key corresponds to the binary indicator in "datagen_info" that signals
+        #         # when this subtask is finished (e.g., on a 0 to 1 edge).
+        #         # subtask_term_signal="grasp_1",
+        #         subtask_term_signal="grasp_2",
+        #         # Specifies time offsets for data generation when splitting a trajectory into
+        #         # subtask segments. Random offsets are added to the termination boundary.
+        #         subtask_term_offset_range=(10, 20),
+        #         # Selection strategy for the source subtask segment during data generation
+        #         selection_strategy="nearest_neighbor_object",
+        #         # Optional parameters for the selection strategy function
+        #         selection_strategy_kwargs={"nn_k": 3},
+        #         # Amount of action noise to apply during this subtask
+        #         action_noise=0.03,
+        #         # Number of interpolation steps to bridge to this subtask segment
+        #         num_interpolation_steps=5,
+        #         # Additional fixed steps for the robot to reach the necessary pose
+        #         num_fixed_steps=0,
+        #         # If True, apply action noise during the interpolation phase and execution
+        #         apply_noise_during_interpolation=False,
+        #         #description="Grasp red cube",
+        #         description="Grasp blue cube", 
+        #         # next_subtask_description="Stack red cube on top of blue cube",
+        #         next_subtask_description="Stack blue cube on top of red cube",
+        #     )
+        # )
+        # subtask_configs.append(
+        #     SubTaskConfig(
+        #         # Each subtask involves manipulation with respect to a single object frame.
+        #         # object_ref="cube_1",
+        #         object_ref="cube_2",
+        #         # Corresponding key for the binary indicator in "datagen_info" for completion
+        #         # subtask_term_signal="stack_1",
+        #         subtask_term_signal="stack_2",
+        #         # Time offsets for data generation when splitting a trajectory
+        #         subtask_term_offset_range=(10, 20),
+        #         # Selection strategy for source subtask segment
+        #         selection_strategy="nearest_neighbor_object",
+        #         # Optional parameters for the selection strategy function
+        #         selection_strategy_kwargs={"nn_k": 3},
+        #         # Amount of action noise to apply during this subtask
+        #         action_noise=0.03,
+        #         # Number of interpolation steps to bridge to this subtask segment
+        #         num_interpolation_steps=5,
+        #         # Additional fixed steps for the robot to reach the necessary pose
+        #         num_fixed_steps=0,
+        #         # If True, apply action noise during the interpolation phase and execution
+        #         apply_noise_during_interpolation=False,
+        #         next_subtask_description="Grasp green cube",
+        #     )
+        # )
+        # subtask_configs.append(
+        #     SubTaskConfig(
+        #         # Each subtask involves manipulation with respect to a single object frame.
+        #         object_ref="cube_3",
+        #         # Corresponding key for the binary indicator in "datagen_info" for completion
+        #         # subtask_term_signal="grasp_2",
+        #         subtask_term_signal="grasp_1",
+        #         # Time offsets for data generation when splitting a trajectory
+        #         subtask_term_offset_range=(10, 20),
+        #         # Selection strategy for source subtask segment
+        #         selection_strategy="nearest_neighbor_object",
+        #         # Optional parameters for the selection strategy function
+        #         selection_strategy_kwargs={"nn_k": 3},
+        #         # Amount of action noise to apply during this subtask
+        #         action_noise=0.03,
+        #         # Number of interpolation steps to bridge to this subtask segment
+        #         num_interpolation_steps=5,
+        #         # Additional fixed steps for the robot to reach the necessary pose
+        #         num_fixed_steps=0,
+        #         # If True, apply action noise during the interpolation phase and execution
+        #         apply_noise_during_interpolation=False,
+        #         # next_subtask_description="Stack green cube on top of red cube",
+        #         next_subtask_description="Stack green cube on top of blue cube",
+        #     )
+        # )
+        # subtask_configs.append(
+        #     SubTaskConfig(
+        #         # Each subtask involves manipulation with respect to a single object frame.
+        #         # object_ref="cube_2",
+        #         object_ref="cube_1",
+        #         # End of final subtask does not need to be detected
+        #         subtask_term_signal=None,
+        #         # No time offsets for the final subtask
+        #         subtask_term_offset_range=(0, 0),
+        #         # Selection strategy for source subtask segment
+        #         selection_strategy="nearest_neighbor_object",
+        #         # Optional parameters for the selection strategy function
+        #         selection_strategy_kwargs={"nn_k": 3},
+        #         # Amount of action noise to apply during this subtask
+        #         action_noise=0.03,
+        #         # Number of interpolation steps to bridge to this subtask segment
+        #         num_interpolation_steps=5,
+        #         # Additional fixed steps for the robot to reach the necessary pose
+        #         num_fixed_steps=0,
+        #         # If True, apply action noise during the interpolation phase and execution
+        #         apply_noise_during_interpolation=False,
+        #     )
+        # )
+        # self.subtask_configs["franka"] = subtask_configs
