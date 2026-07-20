@@ -214,7 +214,8 @@ def create_environment_config(
     success_term = None
     if hasattr(env_cfg.terminations, "success"):
         success_term = env_cfg.terminations.success
-        #print("success_term, ", success_term)
+        print("env_cfg (managerbasedrlenvconfig), ", env_cfg)
+        print("success_term, ", success_term)
         env_cfg.terminations.success = None
     else:
         logger.warning(

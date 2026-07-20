@@ -106,6 +106,8 @@ def main():
         generation_num_trials=args_cli.generation_num_trials,
     )
 
+    print("success_term, ", success_term)
+
     # Create environment
     env = gym.make(env_name, cfg=env_cfg).unwrapped
 

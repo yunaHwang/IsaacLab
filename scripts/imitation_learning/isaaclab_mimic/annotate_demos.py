@@ -296,7 +296,7 @@ def main():
                 print(f"\nAnnotating episode #{episode_index} ({episode_name})")
                 episode = dataset_file_handler.load_episode(episode_name, env.device)
 
-                # # NOTE: yuna-added <check episode structure>
+                # # # NOTE: yuna-added <check episode structure>
                 # ep_grp = episode.data
                 # subtask_term_signals_dict = ep_grp["obs"]["datagen_info"]["subtask_term_signals"]
 

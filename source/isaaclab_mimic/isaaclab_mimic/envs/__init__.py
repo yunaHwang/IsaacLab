@@ -20,6 +20,29 @@ gym.register(
     disable_env_checker=True,
 )
 
+# added! Yuna
+gym.register(
+    id="Isaac-Stack-Cube-BlueGreenRed-Franka-IK-Rel-Mimic-v0",
+    entry_point=f"{__name__}.franka_stack_ik_rel_mimic_env:FrankaCubeStackIKRelMimicEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.franka_stack_ik_rel_mimic_env_cfg:FrankaCubeStackIKRelMimicEnvCfg",
+
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Stack-Cube-BlueGreenRed-Franka-IK-Rel-Visuomotor-Mimic-v0",
+    entry_point=f"{__name__}.franka_stack_ik_rel_mimic_env:FrankaCubeStackIKRelMimicEnv",
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.franka_stack_ik_rel_visuomotor_mimic_env_cfg:FrankaCubeStackIKRelVisuomotorMimicEnvCfg"
+        ),
+    },
+    disable_env_checker=True,
+)
+###########
+
 gym.register(
     id="Isaac-Stack-Cube-Franka-IK-Rel-Blueprint-Mimic-v0",
     entry_point=f"{__name__}.franka_stack_ik_rel_mimic_env:FrankaCubeStackIKRelMimicEnv",

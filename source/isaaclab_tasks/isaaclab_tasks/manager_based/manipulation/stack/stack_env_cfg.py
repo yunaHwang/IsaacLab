@@ -109,19 +109,19 @@ class ObservationsCfg:
 
         # NOTE: yuna - for original ID, use the very bottom, if not (OOD; created), use the one below that
 
-        grasp_1= ObsTerm(
+        grasp_3= ObsTerm(
             func=mdp.object_grasped,
             params={
                 "robot_cfg": SceneEntityCfg("robot"),
                 "ee_frame_cfg": SceneEntityCfg("ee_frame"),
-                "object_cfg": SceneEntityCfg("cube_2") #was cube_2
+                "object_cfg": SceneEntityCfg("cube_3") #was cube_2
             },
         )
-        stack_1= ObsTerm(
+        stack_3= ObsTerm(
             func=mdp.object_stacked,
             params={
                 "robot_cfg": SceneEntityCfg("robot"),
-                "upper_object_cfg": SceneEntityCfg("cube_2"),#was cube_2
+                "upper_object_cfg": SceneEntityCfg("cube_3"),#was cube_2
                 "lower_object_cfg": SceneEntityCfg("cube_1"),#was cube_1
             },
         )
@@ -130,9 +130,34 @@ class ObservationsCfg:
             params={
                 "robot_cfg": SceneEntityCfg("robot"),
                 "ee_frame_cfg": SceneEntityCfg("ee_frame"),
-                "object_cfg": SceneEntityCfg("cube_3"),
+                "object_cfg": SceneEntityCfg("cube_2"),
             },
         )
+
+        # grasp_1= ObsTerm(
+        #     func=mdp.object_grasped,
+        #     params={
+        #         "robot_cfg": SceneEntityCfg("robot"),
+        #         "ee_frame_cfg": SceneEntityCfg("ee_frame"),
+        #         "object_cfg": SceneEntityCfg("cube_2") #was cube_2
+        #     },
+        # )
+        # stack_1= ObsTerm(
+        #     func=mdp.object_stacked,
+        #     params={
+        #         "robot_cfg": SceneEntityCfg("robot"),
+        #         "upper_object_cfg": SceneEntityCfg("cube_2"),#was cube_2
+        #         "lower_object_cfg": SceneEntityCfg("cube_1"),#was cube_1
+        #     },
+        # )
+        # grasp_2= ObsTerm(
+        #     func=mdp.object_grasped,
+        #     params={
+        #         "robot_cfg": SceneEntityCfg("robot"),
+        #         "ee_frame_cfg": SceneEntityCfg("ee_frame"),
+        #         "object_cfg": SceneEntityCfg("cube_3"),
+        #     },
+        # )
 
         # grasp_2 = ObsTerm(
         #     func=mdp.object_grasped,

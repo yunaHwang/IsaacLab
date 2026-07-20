@@ -75,7 +75,7 @@ from isaaclab.utils.datasets import EpisodeData, HDF5DatasetFileHandler
 if args_cli.enable_pinocchio:
     import isaaclab_tasks.manager_based.locomanipulation.pick_place  # noqa: F401
     import isaaclab_tasks.manager_based.manipulation.pick_place  # noqa: F401
-
+import isaaclab_mimic.envs  # noqa: F401
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
@@ -168,6 +168,11 @@ def main():
     env_cfg.terminations = {}
 
     # create environment from loaded config
+    print(
+    "Isaac-Stack-Cube-BlueGreenRed-Franka-IK-Rel-Mimic-v0"
+    in gym.registry
+)
+
     env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
 
     teleop_interface = Se3Keyboard(Se3KeyboardCfg(pos_sensitivity=0.1, rot_sensitivity=0.1))
