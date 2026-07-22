@@ -75,8 +75,10 @@ if args_cli.enable_pinocchio:
 
 from isaaclab_tasks.utils import parse_env_cfg
 
+from collections import deque
 
-def rollout(policy, env, success_term, horizon, device):
+
+def rollout(policy, env, success_term, horizon, device, is_diffusion_policy = False):
     """Perform a single rollout of the policy in the environment.
 
     Args:
@@ -91,11 +93,42 @@ def rollout(policy, env, success_term, horizon, device):
     """
     policy.start_episode()
     obs_dict, _ = env.reset()
+
+
+    # if is_diffusion_policy -> obs has to be dimension 2
+    if is_diffusion_policy:
+        observation_horizon = 2
+
+        obs_history = deque(maxlen=observation_horizon)
+
+
     traj = dict(actions=[], obs=[], next_obs=[])
 
+    # Prepare first observation
+    obs = copy.deepcopy(obs_dict["policy"])
+
+    obs = {
+        k: obs[k]
+        for k in ["eef_pos", "gripper_pos", "object", "eef_quat"]
+    }
+
+    for ob in obs:
+        obs[ob] = torch.squeeze(obs[ob])
+
+    if is_diffusion_policy:
+        # Initialize history with repeated first observation
+        for _ in range(observation_horizon):
+            obs_history.append(obs)
+
+    
     for i in range(horizon):
         # Prepare observations
         obs = copy.deepcopy(obs_dict["policy"])
+        obs = {
+            k: obs[k]
+            for k in ["eef_pos", "gripper_pos", "object", "eef_quat"]
+        }
+
         for ob in obs:
             obs[ob] = torch.squeeze(obs[ob])
 
@@ -111,10 +144,38 @@ def rollout(policy, env, success_term, horizon, device):
                     image = image.clip(0.0, 1.0)
                     obs[image_name] = image
 
-        traj["obs"].append(obs)
 
-        # Compute actions
-        actions = policy(obs)
+        # if is_diffusion_policy -> obs has to be dimension 2
+        if is_diffusion_policy:
+            # Add current observation to history
+            obs_history.append(obs)
+
+            # Convert observation history into diffusion-policy input
+            obs_seq = {}
+
+            for key in obs_history[0].keys():
+                obs_seq[key] = torch.stack(
+                    [o[key] for o in obs_history],
+                    dim=0
+                ).unsqueeze(0).to(device)
+
+            # Debug once
+            if i == 0:
+                print("Observation shapes sent to policy:")
+                for k, v in obs_seq.items():
+                    print(k, v.shape)
+
+            traj["obs"].append(obs_seq)
+
+            actions = policy(obs_seq, batched_ob = True)
+
+        else:
+            traj["obs"].append(obs)
+
+            # Compute actions
+            actions = policy(obs)
+
+
 
         # Unnormalize actions
         if args_cli.norm_factor_min is not None and args_cli.norm_factor_max is not None:
@@ -176,7 +237,11 @@ def main():
     for trial in range(args_cli.num_rollouts):
         print(f"[INFO] Starting trial {trial}")
         policy, _ = FileUtils.policy_from_checkpoint(ckpt_path=args_cli.checkpoint, device=device)
-        terminated, traj = rollout(policy, env, success_term, args_cli.horizon, device)
+
+        #NOTE - yuna added
+        is_diffusion_policy = True
+
+        terminated, traj = rollout(policy, env, success_term, args_cli.horizon, device, is_diffusion_policy)
         results.append(terminated)
         print(f"[INFO] Trial {trial}: {terminated}\n")
 
