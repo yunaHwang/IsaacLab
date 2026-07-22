@@ -174,6 +174,10 @@ def rollout(policy, env, success_term, horizon, device, is_diffusion_policy = Fa
 
             # Compute actions
             actions = policy(obs)
+        
+        
+        # print("actions, ", actions)
+        # print(len(actions))
 
 
 
@@ -204,6 +208,16 @@ def rollout(policy, env, success_term, horizon, device, is_diffusion_policy = Fa
 
 def main():
     """Run a trained policy from robomimic with Isaac Lab environment."""
+
+    import gymnasium as gym
+
+    import isaaclab_mimic.envs
+
+    print("Mimic envs:")
+    for name in gym.registry.keys():
+        if "Mimic" in name:
+            print(name)
+
     # parse configuration
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1, use_fabric=not args_cli.disable_fabric)
 
@@ -244,6 +258,7 @@ def main():
         terminated, traj = rollout(policy, env, success_term, args_cli.horizon, device, is_diffusion_policy)
         results.append(terminated)
         print(f"[INFO] Trial {trial}: {terminated}\n")
+        #print("traj, ", traj)
 
     print(f"\nSuccessful trials: {results.count(True)}, out of {len(results)} trials")
     print(f"Success rate: {results.count(True) / len(results)}")
