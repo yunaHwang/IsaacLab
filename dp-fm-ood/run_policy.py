@@ -22,6 +22,11 @@ Args:
 
 import argparse
 
+import robomimic.utils.file_utils as FileUtils
+import robomimic.utils.torch_utils as TorchUtils
+
+from diffusion_loss import compute_diffusion_loss, load_loss_reference
+
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
@@ -29,10 +34,21 @@ parser = argparse.ArgumentParser(description="Evaluate robomimic policy for Isaa
 
 parser.add_argument("--device", type=str, default="cpu")
 parser.add_argument("--checkpoint", type=str, required=True)
-parser.add_argument("--ood_detection_metric", type=str, choices=['diffdaggerloss', 'density'])
-parser.add_argument("--dataset", type=str, default=None) # use when calculating loss range for rollouts and not user actions
-parser.add_argument("--save_to_file", action="store_true")
-parser.add_argument("--save_file_name", type=str, default=None)
+parser.add_argument("--ood_detection_metric", type=str, choices=['diffdaggerloss', 'density']) # NOTE: add as I go
+parser.add_argument(
+    "--loss_range", type=str, default=None,
+    help="Path to a reference loss-distribution CSV produced by diffusion_loss.py "
+    "(python diffusion_loss.py --hdf5_dataset ... --save_file_name ...). Used to score "
+    "how in-distribution a live rollout's diffusion loss is via its CDF percentile.",
+)
+parser.add_argument(
+    "--num_samples", type=int, default=512,
+    help="Number of (noise, timestep) draws to average the live diffusion loss over "
+    "(diffdagger's Nb in noise_estimation_loss_nb_infer). The live action is fixed for "
+    "the duration of a step, so averaging multiple draws reduces the loss's variance; "
+    "the offline --loss_range sweep in diffusion_loss.py doesn't need this since it scores "
+    "many distinct dataset (obs, action) pairs instead of resampling the same one.",
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -50,23 +66,26 @@ import random
 
 import gymnasium as gym
 import numpy as np
-import robomimic.utils.file_utils as FileUtils
-import robomimic.utils.torch_utils as TorchUtils
 import torch
 
+from isaaclab.devices import Se3SpaceMouse, Se3SpaceMouseCfg
 from isaaclab_tasks.utils import parse_env_cfg
 
 from collections import deque
 
 
-def run_policy(policy, env, success_term, horizon, device, is_diffusion_policy = False, not_blend = True):
-    from robomimic.algo.diffusion_policy import compute_diffusion_loss #TODO - this name might have to change based on the actual name once i have robomimic as my submodule
-
-    import h5py
-
-    import pandas as pd
-
-    """Perform action blending by 1) grabbing the action from the policy, 2) registering user action, 
+def run_policy(
+    policy,
+    env,
+    success_term,
+    horizon,
+    device,
+    is_diffusion_policy=False,
+    not_blend=True,
+    teleop_interface=None,
+    loss_cdf=None,
+):
+    """Perform action blending by 1) grabbing the action from the policy, 2) registering user action,
     3) function call for some metric (loss), 4) save metric value if necessary.
 
     Args:
@@ -74,6 +93,10 @@ def run_policy(policy, env, success_term, horizon, device, is_diffusion_policy =
         env: The environment to play in.
         horizon: The step horizon of each rollout.
         device: The device to run the policy on.
+        teleop_interface: A device (e.g. Se3SpaceMouse) to read the live human action from.
+            Required when not_blend=False.
+        loss_cdf: Optional diffusion_loss.LossCDF built from a reference loss-distribution
+            CSV (see --loss_range), used to report the live loss's percentile against it.
 
     Returns:
         terminated: Whether the rollout terminated.
@@ -81,6 +104,8 @@ def run_policy(policy, env, success_term, horizon, device, is_diffusion_policy =
     """
     policy.start_episode()
     obs_dict, _ = env.reset()
+    if teleop_interface is not None:
+        teleop_interface.reset()
 
 
     # if is_diffusion_policy -> obs has to be dimension 2
@@ -167,8 +192,6 @@ def run_policy(policy, env, success_term, horizon, device, is_diffusion_policy =
         # print("actions, ", actions)
         # print(len(actions))
 
-
-
         # Unnormalize actions
         if args_cli.norm_factor_min is not None and args_cli.norm_factor_max is not None:
             policy_actions = (
@@ -186,30 +209,39 @@ def run_policy(policy, env, success_term, horizon, device, is_diffusion_policy =
             traj["policy_actions"].append(policy_actions.tolist())
             traj["next_obs"].append(obs)
         else:
-            # TODO: register user_action
-            if args_cli.metric == "diffdaggerloss":
-                if args_cli.metric == "dataset":
-                    # use existing dataset (ID/OOD's obs and actions)
-                    all_demo_losses = dict()
-                    
-                    with h5py.File(args_cli.dataset, "r") as f:
-                        data = f["data"]
-                        for demo in data.keys():
-                            actions = demo["actions"]
-                            obs = demo["obs"]
-                            states = demo["states"]
-            
-                            loss = compute_diffusion_loss(obs, states)
-                            all_demo_losses[demo] = loss 
-            
-                    if args_cli.save_to_file:
-                        all_demo_losses_df = pd.DataFrame(all_demo_losses)
-                        all_demo_losses_df.to_csv(args_cli.save_file_name + ".csv", index = False)
-                else:
-                    # use user input from an input device
-                    loss = compute_diffusion_loss(obs, user_actions)
+            # reference loss-distribution calibration is a separate offline step, see
+            # diffusion_loss.py - this branch only scores the live human action against
+            # the trained policy (and, if --loss_range was given, against that reference).
+            loss = None
+            if args_cli.ood_detection_metric == "diffdaggerloss":
+                if teleop_interface is None:
+                    raise RuntimeError(
+                        "run_policy(..., not_blend=False) requires a teleop_interface "
+                        "(e.g. Se3SpaceMouse) to read the live human action from."
+                    )
+                # [7]: [x, y, z, rx, ry, rz, gripper] delta-pose command, already on `device`
+                # https://isaac-sim.github.io/IsaacLab/main/source/api/lab/isaaclab.devices.html
+                user_action = teleop_interface.advance()
+                # diffdagger-style Nb-sample averaging: the action is fixed for this step,
+                # so average multiple (noise, timestep) draws to reduce the loss's variance
+                sample_losses = torch.stack(
+                    [compute_diffusion_loss(policy, obs_seq, user_action) for _ in range(args_cli.num_samples)]
+                )
+                loss = sample_losses.mean(dim=0)
+                msg = f"[OOD] diffusion loss for current human action: {loss.item():.4f}"
+                if loss_cdf is not None:
+                    percentile = loss_cdf(loss.item())
+                    msg += f" (percentile vs. reference loss range: {percentile:.3f})"
+                print(msg)
 
-            # TODO: define blended actions here
+            # TODO: define blended_actions from policy_actions + user_action + loss/gamma
+            # (see compute_linear_gamma / compute_sigmoid_gamma in joystick_diffdagger.py
+            # for the gamma-blend pattern to adapt here).
+            raise NotImplementedError(
+                "Action blending (not_blend=False) isn't wired up yet: user_action and its "
+                "diffusion loss are now available above, but the blend rule that turns them "
+                "into blended_actions still needs to be chosen."
+            )
 
             obs_dict, _, terminated, truncated, _ = env.step(blended_actions)
             obs = obs_dict["policy"]
@@ -267,17 +299,34 @@ def main():
     # Acquire device
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
 
-    # Run policy
+    # optional reference loss distribution (see diffusion_loss.py) to score live losses
+    # against via CDF percentile
+    loss_cdf = None
+    if args_cli.loss_range is not None:
+        loss_cdf = load_loss_reference(args_cli.loss_range)
+        print(f"[INFO] Loaded reference loss CDF from {args_cli.loss_range} (range: {loss_cdf.min:.4f} - {loss_cdf.max:.4f})")
+
+    #NOTE - yuna added
+    is_diffusion_policy = True
+    not_blend = True
+
+    # only needed once blending is actually wired up (not_blend=False); created once
+    # here rather than per-trial since it opens a USB device + background read thread.
+    teleop_interface = None
+    if not not_blend:
+        teleop_interface = Se3SpaceMouse(Se3SpaceMouseCfg(sim_device=device))
+        print(teleop_interface)
+
+    # Run policy on live actions input from Isaac Lab
     results = []
     for trial in range(args_cli.num_rollouts):
         print(f"[INFO] Starting trial {trial}")
         policy, _ = FileUtils.policy_from_checkpoint(ckpt_path=args_cli.checkpoint, device=device)
 
-        #NOTE - yuna added
-        is_diffusion_policy = True
-        not_blend = True
-
-        terminated, traj = run_policy(policy, env, success_term, args_cli.horizon, device, is_diffusion_policy, not_blend)
+        terminated, traj = run_policy(
+            policy, env, success_term, args_cli.horizon, device,
+            is_diffusion_policy, not_blend, teleop_interface, loss_cdf,
+        )
         results.append(terminated)
         print(f"[INFO] Trial {trial}: {terminated}\n")
         #print("traj, ", traj)
