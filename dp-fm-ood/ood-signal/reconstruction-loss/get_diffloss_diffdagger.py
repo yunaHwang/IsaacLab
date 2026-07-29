@@ -17,7 +17,7 @@ import robomimic.utils.tensor_utils as TensorUtils
 DEFAULT_OBS_KEYS = ["eef_pos", "gripper_pos", "object", "eef_quat"]
 
 
-# NOTE. should implement only pure state, too.
+# TODO. should implement only pure state, too.
 def compute_diffusion_loss(policy, obs_seq, action, device=None):
     """Score a candidate action under a robomimic DiffusionPolicyUNet's noise-prediction
     objective, without training or modifying robomimic's installed source.

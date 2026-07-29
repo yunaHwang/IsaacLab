@@ -21,11 +21,14 @@ Args:
 
 
 import argparse
+import os
+import sys
 
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.torch_utils as TorchUtils
 
-from diffusion_loss import compute_diffusion_loss, load_loss_reference
+sys.path.append(os.path.join(os.path.dirname(__file__), "ood-signal", "reconstruction-loss"))
+from get_diffloss_diffdagger import compute_diffusion_loss, load_loss_reference
 
 from isaaclab.app import AppLauncher
 
