@@ -293,37 +293,66 @@ def run_dp_policy(
 
     return False, traj
 
-def run_gloves_fm_policy(gloves_policy, device, teleop_interface, not_blend = True):
+def run_gloves_fm_policy(gloves_policy, obs_history, device, teleop_interface, not_blend = True):
     """Score the live human action against a GLOVES flow policy's density non-conformity
-    score, analogous to run_dp_policy's diffdaggerloss branch.
+    score s(x) = ||z_hat(x)||^2 (paper Eq. 6; see compute_density_score/compute_z_hat in
+    density_nonconformity_score_calc.py), analogous to run_dp_policy's diffdaggerloss branch.
 
     Not implemented yet: unlike run_dp_policy, this function has no env/success_term/horizon
-    parameters, so it has no rollout loop to reset the env, step actions, check success, or
-    build up obs_history/traj from - that still needs to be added before the body below
-    (which references obs_history and traj without defining either) can run.
+    parameters, so it has no rollout loop of its own to reset the env, step actions, check
+    success, or build up obs_history/traj across steps - obs_history must be supplied by the
+    caller for now (built the same way as run_dp_policy's own obs_history, from the same
+    eef_pos/gripper_pos/object/eef_quat keys - see compute_density_score's docstring), and
+    this scores a single step rather than looping over `horizon` steps. env-stepping/
+    blending (the not_blend=True path, and the blend itself below) still needs
+    env/success_term/horizon wired in before it can run - see the two NotImplementedError
+    raises below.
 
     Args:
         gloves_policy: The trained GLOVES DiTPolicy to score actions against (see
             --fm_checkpoint).
+        obs_history: iterable of `n_obs_steps` obs dicts, in compute_density_score's expected
+            format (same keys/shape as run_dp_policy's own obs_history deque).
         device: The device to run the policy on.
         teleop_interface: A device (e.g. Se3SpaceMouse) to read the live human action from.
-        not_blend: If True, execute the policy's own actions directly. If False, score the
-            live human action's density and blend with it instead - not wired up yet.
+            Required when not_blend=False.
+        not_blend: If True, execute the policy's own actions directly - not wired up yet
+            (see TODO below). If False, score the live human action's density.
 
     Returns:
         terminated: Whether the rollout terminated.
         traj: The trajectory of the rollout.
     """
-    raise NotImplementedError("This function is not implemented yet.")
+    if not_blend:
+        # TODO: generate gloves_policy's own action chunk (DiTFlowModel.generate_actions,
+        # i.e. actually running F_theta forward) and env.step it, mirroring run_dp_policy's
+        # not_blend=True branch. Needs env/success_term/horizon wired in first (see docstring).
+        raise NotImplementedError(
+            "run_gloves_fm_policy(..., not_blend=True) isn't wired up yet: needs "
+            "env/success_term/horizon to generate and step GLOVES' own actions."
+        )
 
+    if teleop_interface is None:
+        raise RuntimeError(
+            "run_gloves_fm_policy(..., not_blend=False) requires a teleop_interface "
+            "(e.g. Se3SpaceMouse) to read the live human action from."
+        )
+    # [7]: [x, y, z, rx, ry, rz, gripper] delta-pose command, already on `device`
+    # https://isaac-sim.github.io/IsaacLab/main/source/api/lab/isaaclab.devices.html
     user_action = teleop_interface.advance()
 
-    # TODO - need to define obs_history here
-    score = compute_density_score(gloves_policy.dit_flow, obs_history, user_action)
-    loss = score
+    score = compute_density_score(gloves_policy.dit_flow, obs_history, user_action, device=device)
     print(f"[OOD] density non-conformity score for current human action: {score.item():.4f}")
 
-    return False, traj
+    # TODO: define blended_actions from gloves_policy's own action + user_action + score/gamma
+    # (see compute_linear_gamma / compute_sigmoid_gamma in joystick_diffdagger.py for the
+    # gamma-blend pattern to adapt here), then env.step(blended_actions) and record traj -
+    # needs env/success_term/horizon wired in first (see docstring above).
+    raise NotImplementedError(
+        "Action blending (not_blend=False) isn't wired up yet: user_action and its density "
+        "score are now available above, but env-stepping/blending needs env/success_term/"
+        "horizon plumbed into this function first."
+    )
     
 
 def main():
@@ -412,7 +441,10 @@ def main():
             policy.to(device)
             policy.eval()
 
-            terminated, traj = run_gloves_fm_policy(policy, device, teleop_interface, not_blend)
+            # TODO: obs_history needs to come from a real rollout loop (see
+            # run_gloves_fm_policy's docstring) - not wired up yet, so this call always
+            # raises NotImplementedError before obs_history=None would matter.
+            terminated, traj = run_gloves_fm_policy(policy, None, device, teleop_interface, not_blend)
 
         elif policy_backbone == "diffusion_policy":
 
