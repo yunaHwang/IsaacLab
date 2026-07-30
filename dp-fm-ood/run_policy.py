@@ -3,13 +3,26 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Script to play and evaluate a trained policy from robomimic.
+"""Script to play and evaluate a trained policy in an Isaac Lab environment.
 
-This script loads a robomimic policy and plays it in an Isaac Lab environment.
+Dispatches to one of two policy backbones depending on --ood_detection_metric: a robomimic
+diffusion policy (run_dp_policy, scored via diffdagger-style diffusion loss) or a GLOVES flow
+policy (run_gloves_fm_policy, scored via density non-conformity).
 
 Args:
     task: Name of the environment.
-    checkpoint: Path to the robomimic policy checkpoint.
+    dp_checkpoint: Path to the robomimic diffusion policy checkpoint. Required when
+        --ood_detection_metric=diffdaggerloss.
+    fm_checkpoint: Path or hub id of a trained GLOVES policy checkpoint. Required when
+        --ood_detection_metric=density.
+    ood_detection_metric: Which OOD signal to compute: 'diffdaggerloss' or 'density'.
+    blending_mechanism: Which GLOVES action-blending mechanism to use once blending is
+        wired up ('gloves_fpas', 'gloves_feeg', or 'gloves_ifae').
+    blend: If set, enable action blending (not_blend=False); otherwise the policy's own
+        actions are executed directly.
+    num_samples: Number of (noise, timestep) draws to average the live diffusion loss over.
+    loss_range: If provided, path to a reference loss-distribution CSV to score the live
+        diffusion loss's percentile against.
     horizon: If provided, override the step horizon of each rollout.
     num_rollouts: If provided, override the number of rollouts.
     seed: If provided, overeride the default random seed.
@@ -30,20 +43,23 @@ import robomimic.utils.torch_utils as TorchUtils
 sys.path.append(os.path.join(os.path.dirname(__file__), "ood-signal", "reconstruction-loss"))
 from get_diffloss_diffdagger import compute_diffusion_loss, load_loss_reference
 
+sys.path.append(os.path.join(os.path.dirname(__file__), "ood-signal", "density"))
+from density_nonconformity_score_calc import compute_density_score
+from lerobot_policy_gloves.modeling_gloves import DiTPolicy
+
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Evaluate robomimic policy for Isaac Lab environment.")
 
 parser.add_argument("--device", type=str, default="cpu")
-parser.add_argument("--checkpoint", type=str, required=True)
+
 parser.add_argument("--ood_detection_metric", type=str, choices=['diffdaggerloss', 'density']) # NOTE: add as I go
-parser.add_argument(
-    "--loss_range", type=str, default=None,
-    help="Path to a reference loss-distribution CSV produced by diffusion_loss.py "
-    "(python diffusion_loss.py --hdf5_dataset ... --save_file_name ...). Used to score "
-    "how in-distribution a live rollout's diffusion loss is via its CDF percentile.",
-)
+parser.add_argument("--blending_mechanism", type=str, choices=['gloves_fpas', 'gloves_feeg', 'gloves_ifae']) # NOTE: add as I go
+# FOR now: have not blend as a default, meaning that without this flag, then it will default to not blendd
+parser.add_argument("--blend", action = 'store_true')
+
+
 parser.add_argument(
     "--num_samples", type=int, default=512,
     help="Number of (noise, timestep) draws to average the live diffusion loss over "
@@ -51,6 +67,28 @@ parser.add_argument(
     "the duration of a step, so averaging multiple draws reduces the loss's variance; "
     "the offline --loss_range sweep in diffusion_loss.py doesn't need this since it scores "
     "many distinct dataset (obs, action) pairs instead of resampling the same one.",
+)
+
+# Types of models and related parameters grouped together
+# DP
+parser.add_argument("--dp_checkpoint", type=str, default=None,
+    help="Path of a trained diffusion policy checkpoint (see "
+    "ood-signal/reconstruction-loss/get_diffloss_diffdagger.py). Required when "
+    "--ood_detection_metric=diffdaggerloss")
+parser.add_argument(
+    "--loss_range", type=str, default=None,
+    help="Path to a reference loss-distribution CSV produced by diffusion_loss.py "
+    "(python diffusion_loss.py --hdf5_dataset ... --save_file_name ...). Used to score "
+    "how in-distribution a live rollout's diffusion loss is via its CDF percentile.",
+)
+
+# FM
+parser.add_argument(
+    "--fm_checkpoint", type=str, default=None,
+    help="Path or hub id of a trained GLOVES policy checkpoint (see "
+    "ood-signal/density/density_nonconformity_score_calc.py). Required when "
+    "--ood_detection_metric=density; scores the live human action via GLOVES' density "
+    "non-conformity score instead of the diffdagger-style diffusion loss.",
 )
 
 # append AppLauncher cli args
@@ -77,29 +115,32 @@ from isaaclab_tasks.utils import parse_env_cfg
 from collections import deque
 
 
-def run_policy(
+def run_dp_policy(
     policy,
     env,
     success_term,
     horizon,
     device,
-    is_diffusion_policy=False,
-    not_blend=True,
     teleop_interface=None,
     loss_cdf=None,
+    not_blend = True
 ):
     """Perform action blending by 1) grabbing the action from the policy, 2) registering user action,
     3) function call for some metric (loss), 4) save metric value if necessary.
 
     Args:
-        policy: The robomimicpolicy to play.
+        policy: The robomimic diffusion policy to play.
         env: The environment to play in.
+        success_term: The extracted success-termination term (env_cfg.terminations.success),
+            called each step to check whether the rollout succeeded.
         horizon: The step horizon of each rollout.
         device: The device to run the policy on.
         teleop_interface: A device (e.g. Se3SpaceMouse) to read the live human action from.
             Required when not_blend=False.
         loss_cdf: Optional diffusion_loss.LossCDF built from a reference loss-distribution
             CSV (see --loss_range), used to report the live loss's percentile against it.
+        not_blend: If True, execute the policy's own actions directly. If False, blend with
+            the live human action (see teleop_interface) instead - not wired up yet.
 
     Returns:
         terminated: Whether the rollout terminated.
@@ -111,11 +152,9 @@ def run_policy(
         teleop_interface.reset()
 
 
-    # if is_diffusion_policy -> obs has to be dimension 2
-    if is_diffusion_policy:
-        observation_horizon = 2
+    observation_horizon = 2
 
-        obs_history = deque(maxlen=observation_horizon)
+    obs_history = deque(maxlen=observation_horizon)
 
 
     traj = dict(policy_actions=[], blended_actions = [], obs=[], next_obs=[])
@@ -131,10 +170,10 @@ def run_policy(
     for ob in obs:
         obs[ob] = torch.squeeze(obs[ob])
 
-    if is_diffusion_policy:
-        # Initialize history with repeated first observation
-        for _ in range(observation_horizon):
-            obs_history.append(obs)
+
+    # Initialize history with repeated first observation
+    for _ in range(observation_horizon):
+        obs_history.append(obs)
 
     
     for i in range(horizon):
@@ -161,36 +200,28 @@ def run_policy(
                     obs[image_name] = image
 
 
-        # if is_diffusion_policy -> obs has to be dimension 2
-        if is_diffusion_policy:
-            # Add current observation to history
-            obs_history.append(obs)
+        # Add current observation to history
+        obs_history.append(obs)
 
-            # Convert observation history into diffusion-policy input
-            obs_seq = {}
+        # Convert observation history into diffusion-policy input
+        obs_seq = {}
 
-            for key in obs_history[0].keys():
-                obs_seq[key] = torch.stack(
-                    [o[key] for o in obs_history],
-                    dim=0
-                ).unsqueeze(0).to(device)
+        for key in obs_history[0].keys():
+            obs_seq[key] = torch.stack(
+                [o[key] for o in obs_history],
+                dim=0
+            ).unsqueeze(0).to(device)
 
-            # Debug once
-            if i == 0:
-                print("Observation shapes sent to policy:")
-                for k, v in obs_seq.items():
-                    print(k, v.shape)
+        # Debug once
+        if i == 0:
+            print("Observation shapes sent to policy:")
+            for k, v in obs_seq.items():
+                print(k, v.shape)
 
-            traj["obs"].append(obs_seq)
+        traj["obs"].append(obs_seq)
 
-            policy_actions = policy(obs_seq, batched_ob = True)
+        policy_actions = policy(obs_seq, batched_ob = True)
 
-        else:
-            traj["obs"].append(obs)
-
-            # Compute actions
-            policy_actions = policy(obs)
-        
         
         # print("actions, ", actions)
         # print(len(actions))
@@ -215,16 +246,17 @@ def run_policy(
             # reference loss-distribution calibration is a separate offline step, see
             # diffusion_loss.py - this branch only scores the live human action against
             # the trained policy (and, if --loss_range was given, against that reference).
+            if teleop_interface is None:
+                raise RuntimeError(
+                    "run_dp_policy(..., not_blend=False) requires a teleop_interface "
+                    "(e.g. Se3SpaceMouse) to read the live human action from."
+                )
+            # [7]: [x, y, z, rx, ry, rz, gripper] delta-pose command, already on `device`
+            # https://isaac-sim.github.io/IsaacLab/main/source/api/lab/isaaclab.devices.html
+            user_action = teleop_interface.advance()
+
             loss = None
             if args_cli.ood_detection_metric == "diffdaggerloss":
-                if teleop_interface is None:
-                    raise RuntimeError(
-                        "run_policy(..., not_blend=False) requires a teleop_interface "
-                        "(e.g. Se3SpaceMouse) to read the live human action from."
-                    )
-                # [7]: [x, y, z, rx, ry, rz, gripper] delta-pose command, already on `device`
-                # https://isaac-sim.github.io/IsaacLab/main/source/api/lab/isaaclab.devices.html
-                user_action = teleop_interface.advance()
                 # diffdagger-style Nb-sample averaging: the action is fixed for this step,
                 # so average multiple (noise, timestep) draws to reduce the loss's variance
                 sample_losses = torch.stack(
@@ -261,9 +293,42 @@ def run_policy(
 
     return False, traj
 
+def run_gloves_fm_policy(gloves_policy, device, teleop_interface, not_blend = True):
+    """Score the live human action against a GLOVES flow policy's density non-conformity
+    score, analogous to run_dp_policy's diffdaggerloss branch.
+
+    Not implemented yet: unlike run_dp_policy, this function has no env/success_term/horizon
+    parameters, so it has no rollout loop to reset the env, step actions, check success, or
+    build up obs_history/traj from - that still needs to be added before the body below
+    (which references obs_history and traj without defining either) can run.
+
+    Args:
+        gloves_policy: The trained GLOVES DiTPolicy to score actions against (see
+            --fm_checkpoint).
+        device: The device to run the policy on.
+        teleop_interface: A device (e.g. Se3SpaceMouse) to read the live human action from.
+        not_blend: If True, execute the policy's own actions directly. If False, score the
+            live human action's density and blend with it instead - not wired up yet.
+
+    Returns:
+        terminated: Whether the rollout terminated.
+        traj: The trajectory of the rollout.
+    """
+    raise NotImplementedError("This function is not implemented yet.")
+
+    user_action = teleop_interface.advance()
+
+    # TODO - need to define obs_history here
+    score = compute_density_score(gloves_policy.dit_flow, obs_history, user_action)
+    loss = score
+    print(f"[OOD] density non-conformity score for current human action: {score.item():.4f}")
+
+    return False, traj
+    
 
 def main():
-    """Run a trained policy from robomimic with Isaac Lab environment."""
+    """Run a trained policy - robomimic diffusion policy or GLOVES flow policy, chosen via
+    --ood_detection_metric - in an Isaac Lab environment."""
 
     import gymnasium as gym
 
@@ -305,31 +370,59 @@ def main():
     # optional reference loss distribution (see diffusion_loss.py) to score live losses
     # against via CDF percentile
     loss_cdf = None
-    if args_cli.loss_range is not None:
+    if args_cli.loss_range is not None and args_cli.ood_detection_metric == "diffdaggerloss":
         loss_cdf = load_loss_reference(args_cli.loss_range)
         print(f"[INFO] Loaded reference loss CDF from {args_cli.loss_range} (range: {loss_cdf.min:.4f} - {loss_cdf.max:.4f})")
 
-    #NOTE - yuna added
-    is_diffusion_policy = True
-    not_blend = True
-
-    # only needed once blending is actually wired up (not_blend=False); created once
-    # here rather than per-trial since it opens a USB device + background read thread.
+    # Wire up a input device
     teleop_interface = None
-    if not not_blend:
-        teleop_interface = Se3SpaceMouse(Se3SpaceMouseCfg(sim_device=device))
-        print(teleop_interface)
+    teleop_interface = Se3SpaceMouse(Se3SpaceMouseCfg(sim_device=device))
+    print(teleop_interface)
+
+    not_blend = True if not args_cli.blend else False
+
+
+    # Check if necesasry arguments appear together (i.e., checkpoints with the required metrics)
+    if args_cli.ood_detection_metric == "density":
+        if args_cli.fm_checkpoint is None:
+            raise ValueError("--fm_checkpoint is required when --ood_detection_metric=density")
+
+        policy_backbone = "gloves"
+
+    elif args_cli.ood_detection_metric == "diffdaggerloss":
+        if args_cli.dp_checkpoint is None:
+            raise ValueError("--dp_checkpoint is required when --ood_detection_metric=diffdaggerloss")
+
+        policy_backbone = "diffusion_policy"
+
+    else:
+        raise ValueError(
+            "--ood_detection_metric must be 'density' or 'diffdaggerloss', "
+            f"got {args_cli.ood_detection_metric!r}"
+        )
+
 
     # Run policy on live actions input from Isaac Lab
     results = []
     for trial in range(args_cli.num_rollouts):
         print(f"[INFO] Starting trial {trial}")
-        policy, _ = FileUtils.policy_from_checkpoint(ckpt_path=args_cli.checkpoint, device=device)
 
-        terminated, traj = run_policy(
-            policy, env, success_term, args_cli.horizon, device,
-            is_diffusion_policy, not_blend, teleop_interface, loss_cdf,
-        )
+        if policy_backbone == "gloves":
+            policy = DiTPolicy.from_pretrained(args_cli.fm_checkpoint)
+            policy.to(device)
+            policy.eval()
+
+            terminated, traj = run_gloves_fm_policy(policy, device, teleop_interface, not_blend)
+
+        elif policy_backbone == "diffusion_policy":
+
+            policy, _ = FileUtils.policy_from_checkpoint(ckpt_path=args_cli.dp_checkpoint, device=device)
+
+            terminated, traj = run_dp_policy(
+                policy, env, success_term, args_cli.horizon, device,
+                teleop_interface, loss_cdf, not_blend
+            )
+
         results.append(terminated)
         print(f"[INFO] Trial {trial}: {terminated}\n")
         #print("traj, ", traj)
