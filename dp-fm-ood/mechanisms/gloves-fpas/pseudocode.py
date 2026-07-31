@@ -28,9 +28,9 @@ import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "ood-signal", "density"))
 from density_nonconformity_score_calc import nonconformity_score
 
-def get_loss_val(a_k_i, tau, gamma_align, a_u):
+# TODO: write type-checked code
 
-    # TODO - define `velocity_net` and `context`
+def get_loss_val(a_k_i, tau, gamma_align, a_u, velocity_net, context):
     # TODO - check exact math with dimensions
     return max((nonconformity_score(velocity_net, a_k_i, context) - tau), 0) + gamma_align * ((a_k_i - a_u).pow(2).sum())
 
@@ -53,7 +53,14 @@ def main(action_chunk, tau, gamma_align, K, n, eta, sigma):
             perturbs_in_this_k.append(a_k_i)
 
             # calculate loss_val (=violation) with this a_k_i
-            l_val = get_loss_val(a_k_i, tau, gamma_align, a_u)
+            # TODO - define `velocity_net` and `context` (see `density_nonconformity_score_calc.py`)
+            # velocity_net: dit_flow: DiTFlowModel 's velocity_net
+            # context: something like this -- context = dit_flow._prepare_context_tokens(batch)
+
+            velocity_net = ''
+            context = ''
+
+            l_val = get_loss_val(a_k_i, tau, gamma_align, a_u, velocity_net, context)
             l_values_in_this_k.append(l_val)
 
         # --- formula (9): weight each candidate by its violation loss (low loss -> high weight) ---
