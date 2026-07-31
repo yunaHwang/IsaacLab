@@ -13,7 +13,7 @@ it's called flow-prior action sampling because the premise is using z, inspectin
 gauge whether an action is OOD or not.
 
 algo **
-input: non-conformity score s(a)
+input: agent's action a_0, non-conformity score s(a)
 required: calibrated OOD threshold tau, source consistency gamma_align (0 ~ 1), 
         sampling iteration # K, # of candidates n, edit strength eta (0 ~ 1), variance sigma
 output: each iteration's refined action chunk and then eventually a_K (the all, accumulated version)
