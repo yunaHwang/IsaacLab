@@ -6,17 +6,17 @@
 """Script to play and evaluate a trained policy in an Isaac Lab environment.
 
 Dispatches to one of two policy backbones depending on --ood_detection_metric: a robomimic
-diffusion policy (run_dp_policy, scored via diffdagger-style diffusion loss) or a GLOVES flow
-policy (run_gloves_fm_policy, scored via density non-conformity).
+diffusion policy (run_dp_policy, scored via diffdagger-style diffusion loss) or a fm flow
+policy (run_fm_policy, scored via density non-conformity).
 
 Args:
     task: Name of the environment.
     dp_checkpoint: Path to the robomimic diffusion policy checkpoint. Required when
         --ood_detection_metric=diffdaggerloss.
-    fm_checkpoint: Path or hub id of a trained GLOVES policy checkpoint. Required when
+    fm_checkpoint: Path or hub id of a trained fm policy checkpoint. Required when
         --ood_detection_metric=density.
     ood_detection_metric: Which OOD signal to compute: 'diffdaggerloss' or 'density'.
-    blending_mechanism: Which GLOVES action-blending mechanism to use once blending is
+    blending_mechanism: Which gloves action-blending mechanism to use once blending is
         wired up ('gloves_fpas', 'gloves_feeg', or 'gloves_ifae').
     blend: If set, enable action blending (not_blend=False); otherwise the policy's own
         actions are executed directly.
@@ -40,11 +40,13 @@ import sys
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.torch_utils as TorchUtils
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "ood-signal", "reconstruction-loss"))
+sys.path.append(os.path.join(os.path.dirname(__file__), "ood-signal-baseline-papers", "reconstruction-loss"))
 from get_diffloss_diffdagger import compute_diffusion_loss, load_loss_reference
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "ood-signal", "density"))
-from density_nonconformity_score_calc import compute_density_score
+sys.path.append(os.path.join(os.path.dirname(__file__), "ood-signal-baseline-papers", "density"))
+from density_nonconformity_score_calc import compute_density_score, generate_action_chunk, DEFAULT_STATE_KEYS
+
+from state_ood_signal_impl import diffdagger_loss_state_ood, fm_diffdagger_loss_state_ood, density_state_ood, cf_prediction_loss_state_ood, smoothness_loss_state_ood, perturb_loss_state_ood
 from lerobot_policy_gloves.modeling_gloves import DiTPolicy
 
 from isaaclab.app import AppLauncher
@@ -65,7 +67,7 @@ parser.add_argument(
     help="Number of (noise, timestep) draws to average the live diffusion loss over "
     "(diffdagger's Nb in noise_estimation_loss_nb_infer). The live action is fixed for "
     "the duration of a step, so averaging multiple draws reduces the loss's variance; "
-    "the offline --loss_range sweep in diffusion_loss.py doesn't need this since it scores "
+    "the offline --loss_range sweep in get_diffloss_diffdagger.py doesn't need this since it scores "
     "many distinct dataset (obs, action) pairs instead of resampling the same one.",
 )
 
@@ -76,18 +78,24 @@ parser.add_argument("--dp_checkpoint", type=str, default=None,
     "ood-signal/reconstruction-loss/get_diffloss_diffdagger.py). Required when "
     "--ood_detection_metric=diffdaggerloss")
 parser.add_argument(
-    "--loss_range", type=str, default=None,
-    help="Path to a reference loss-distribution CSV produced by diffusion_loss.py "
-    "(python diffusion_loss.py --hdf5_dataset ... --save_file_name ...). Used to score "
+    "--loss_state_range", type=str, default=None,
+    help="Path to a reference loss-distribution CSV produced by get_diffloss_diffdagger.py "
+    "(python get_diffloss_diffdagger.py --hdf5_dataset ... --save_file_name ...). Used to score "
+    "how in-distribution a live rollout's diffusion loss is via its CDF percentile.",
+)
+parser.add_argument(
+    "--loss_action_range", type=str, default=None,
+    help="Path to a reference loss-distribution CSV produced by get_diffloss_diffdagger.py "
+    "(python get_diffloss_diffdagger.py --hdf5_dataset ... --save_file_name ...). Used to score "
     "how in-distribution a live rollout's diffusion loss is via its CDF percentile.",
 )
 
 # FM
 parser.add_argument(
     "--fm_checkpoint", type=str, default=None,
-    help="Path or hub id of a trained GLOVES policy checkpoint (see "
+    help="Path or hub id of a trained fm policy checkpoint (see "
     "ood-signal/density/density_nonconformity_score_calc.py). Required when "
-    "--ood_detection_metric=density; scores the live human action via GLOVES' density "
+    "--ood_detection_metric=density; scores the live human action via fm' density "
     "non-conformity score instead of the diffdagger-style diffusion loss.",
 )
 
@@ -122,7 +130,8 @@ def run_dp_policy(
     horizon,
     device,
     teleop_interface=None,
-    loss_cdf=None,
+    loss_state_cdf=None,
+    loss_action_cdf=None,
     not_blend = True
 ):
     """Perform action blending by 1) grabbing the action from the policy, 2) registering user action,
@@ -137,8 +146,10 @@ def run_dp_policy(
         device: The device to run the policy on.
         teleop_interface: A device (e.g. Se3SpaceMouse) to read the live human action from.
             Required when not_blend=False.
-        loss_cdf: Optional diffusion_loss.LossCDF built from a reference loss-distribution
-            CSV (see --loss_range), used to report the live loss's percentile against it.
+        loss_state_cdf: Optional get_diffloss_diffdagger.LossCDF built from a reference loss-distribution
+            CSV (see --loss_state_range), used to report the live loss's percentile against it.
+        loss_action_cdf: Optional get_diffloss_diffdagger.LossCDF built from a reference loss-distribution
+            CSV (see --loss_action_range), used to report the live loss's percentile against it.
         not_blend: If True, execute the policy's own actions directly. If False, blend with
             the live human action (see teleop_interface) instead - not wired up yet.
 
@@ -234,6 +245,17 @@ def run_dp_policy(
 
         policy_actions = torch.from_numpy(policy_actions).to(device=device).view(1, env.action_space.shape[1])
 
+        ###############
+        # State OOD: score the model's own action against its own state (as opposed to the
+        # teleop user_action scored in the not_blend=False branch below)
+        state_ood_score = diffdagger_loss_state_ood(policy, obs_seq, policy_actions, num_samples=args_cli.num_samples)
+        msg = f"[state OOD] diffusion loss for model's own action: {state_ood_score.item():.4f}"
+        if loss_state_cdf is not None:
+            percentile = loss_state_cdf(state_ood_score.item())
+            msg += f" ([STATE] percentile vs. reference loss range: {percentile:.3f})"
+        print(msg)
+
+        ###############
         # Apply actions
         if not_blend:
             obs_dict, _, terminated, truncated, _ = env.step(policy_actions)
@@ -244,7 +266,7 @@ def run_dp_policy(
             traj["next_obs"].append(obs)
         else:
             # reference loss-distribution calibration is a separate offline step, see
-            # diffusion_loss.py - this branch only scores the live human action against
+            # get_diffloss_diffdagger.py - this branch only scores the live human action against
             # the trained policy (and, if --loss_range was given, against that reference).
             if teleop_interface is None:
                 raise RuntimeError(
@@ -263,10 +285,10 @@ def run_dp_policy(
                     [compute_diffusion_loss(policy, obs_seq, user_action) for _ in range(args_cli.num_samples)]
                 )
                 loss = sample_losses.mean(dim=0)
-                msg = f"[OOD] diffusion loss for current human action: {loss.item():.4f}"
-                if loss_cdf is not None:
-                    percentile = loss_cdf(loss.item())
-                    msg += f" (percentile vs. reference loss range: {percentile:.3f})"
+                msg = f"diffusion loss for current human action: {loss.item():.4f}"
+                if loss_action_cdf is not None:
+                    percentile = loss_action_cdf(loss.item())
+                    msg += f" ([ACTION] percentile vs. reference loss range: {percentile:.3f})"
                 print(msg)
 
             # TODO: define blended_actions from policy_actions + user_action + loss/gamma
@@ -293,8 +315,8 @@ def run_dp_policy(
 
     return False, traj
 
-def run_gloves_fm_policy(gloves_policy, obs_history, device, teleop_interface, not_blend = True):
-    """Score the live human action against a GLOVES flow policy's density non-conformity
+def run_fm_policy(fm_policy, obs_history, device, teleop_interface, not_blend = True):
+    """Score the live human action against a fm flow policy's density non-conformity
     score s(x) = ||z_hat(x)||^2 (paper Eq. 6; see compute_density_score/compute_z_hat in
     density_nonconformity_score_calc.py), analogous to run_dp_policy's diffdaggerloss branch.
 
@@ -303,48 +325,87 @@ def run_gloves_fm_policy(gloves_policy, obs_history, device, teleop_interface, n
     success, or build up obs_history/traj across steps - obs_history must be supplied by the
     caller for now (built the same way as run_dp_policy's own obs_history, from the same
     eef_pos/gripper_pos/object/eef_quat keys - see compute_density_score's docstring), and
-    this scores a single step rather than looping over `horizon` steps. env-stepping/
-    blending (the not_blend=True path, and the blend itself below) still needs
-    env/success_term/horizon wired in before it can run - see the two NotImplementedError
-    raises below.
+    this only handles a single step rather than looping over `horizon` steps. Actually
+    stepping the env with the generated/blended actions (in both branches below) still needs
+    env/success_term/horizon wired in before it can run - see the NotImplementedError raise
+    in the not_blend=False branch, and the TODO comment in the not_blend=True branch.
 
     Args:
-        gloves_policy: The trained GLOVES DiTPolicy to score actions against (see
+        fm_policy: The trained fm DiTPolicy to score actions against (see
             --fm_checkpoint).
         obs_history: iterable of `n_obs_steps` obs dicts, in compute_density_score's expected
-            format (same keys/shape as run_dp_policy's own obs_history deque).
+            format (same keys/shape as run_dp_policy's own obs_history deque). Required when
+            not_blend=True (to generate fm_policy's own action chunk).
         device: The device to run the policy on.
         teleop_interface: A device (e.g. Se3SpaceMouse) to read the live human action from.
             Required when not_blend=False.
-        not_blend: If True, execute the policy's own actions directly - not wired up yet
-            (see TODO below). If False, score the live human action's density.
+        not_blend: If True, generate and return the policy's own action chunk (env-stepping
+            not wired up yet, see TODO below). If False, score the live human action's
+            density.
 
     Returns:
         terminated: Whether the rollout terminated.
         traj: The trajectory of the rollout.
     """
     if not_blend:
-        # TODO: generate gloves_policy's own action chunk (DiTFlowModel.generate_actions,
-        # i.e. actually running F_theta forward) and env.step it, mirroring run_dp_policy's
-        # not_blend=True branch. Needs env/success_term/horizon wired in first (see docstring).
-        raise NotImplementedError(
-            "run_gloves_fm_policy(..., not_blend=True) isn't wired up yet: needs "
-            "env/success_term/horizon to generate and step GLOVES' own actions."
+        if obs_history is None:
+            raise RuntimeError(
+                "run_fm_policy(..., not_blend=True) requires obs_history (an n_obs_steps-long "
+                "iterable of obs dicts, see this function's docstring) to generate the fm "
+                "policy's own action chunk."
+            )
+
+        # Actually run F_theta forward (DiTFlowModel.conditional_sample's ODE solve) to get
+        # the policy's own action chunk. Sampled once as the full (B, horizon, ac_dim) chunk
+        # -- rather than calling generate_action_chunk twice, once truncated and once full,
+        # which would draw two independent samples -- so the action actually meant for
+        # execution and the action scored for state OOD below are the same sample.
+        full_model_actions = generate_action_chunk(
+            fm_policy.dit_flow, obs_history, device=device, full_chunk=True
         )
+        start = fm_policy.config.n_obs_steps - 1
+        end = start + fm_policy.config.n_action_steps
+        model_actions = full_model_actions[:, start:end]
+        print(f"fm policy generated action chunk of shape {tuple(model_actions.shape)}")
+
+        # TODO: env.step through `model_actions`, mirroring run_dp_policy's not_blend=True
+        # branch. Needs env/success_term/horizon wired into this function first (see
+        # docstring).
+        traj = dict(policy_actions=[model_actions.tolist()], blended_actions=[], obs=[], next_obs=[])
+
+        ###############
+        # State OOD: score the model's own action against its own state (as opposed to the
+        # teleop user_action scored in the not_blend=False branch below). Scored against the
+        # full (B, horizon, ac_dim) chunk -- compute_density_score's ac_chunk assert expects
+        # that shape, and it's what the paper's z_hat is defined over -- not the
+        # n_action_steps slice above.
+        state_ood_score = density_state_ood(fm_policy.dit_flow, obs_history, full_model_actions)
+        msg = f"[state OOD] fm density for model's own action: {state_ood_score.item():.4f}"
+        print(msg)
+
+        # fm analog of run_dp_policy's diffdagger-style noise-prediction loss (Nb-sample
+        # averaged flow-matching MSE instead of DDPM noise-prediction MSE), scored against
+        # the same full action chunk as the density score above.
+        fm_loss = fm_diffdagger_loss_state_ood(
+            fm_policy.dit_flow, obs_history, full_model_actions, num_samples=args_cli.num_samples
+        )
+        print(f"[state OOD] fm diffdagger-style loss for model's own action: {fm_loss.item():.4f}")
+
+        return False, traj
 
     if teleop_interface is None:
         raise RuntimeError(
-            "run_gloves_fm_policy(..., not_blend=False) requires a teleop_interface "
+            "run_fm_policy(..., not_blend=False) requires a teleop_interface "
             "(e.g. Se3SpaceMouse) to read the live human action from."
         )
     # [7]: [x, y, z, rx, ry, rz, gripper] delta-pose command, already on `device`
     # https://isaac-sim.github.io/IsaacLab/main/source/api/lab/isaaclab.devices.html
     user_action = teleop_interface.advance()
 
-    score = compute_density_score(gloves_policy.dit_flow, obs_history, user_action, device=device)
-    print(f"[OOD] density non-conformity score for current human action: {score.item():.4f}")
+    score = compute_density_score(fm_policy.dit_flow, obs_history, user_action, device=device)
+    print(f"[ACTION] density non-conformity score for current human action: {score.item():.4f}")
 
-    # TODO: define blended_actions from gloves_policy's own action + user_action + score/gamma
+    # TODO: define blended_actions from fm_policy's own action + user_action + score/gamma
     # (see compute_linear_gamma / compute_sigmoid_gamma in joystick_diffdagger.py for the
     # gamma-blend pattern to adapt here), then env.step(blended_actions) and record traj -
     # needs env/success_term/horizon wired in first (see docstring above).
@@ -356,7 +417,7 @@ def run_gloves_fm_policy(gloves_policy, obs_history, device, teleop_interface, n
     
 
 def main():
-    """Run a trained policy - robomimic diffusion policy or GLOVES flow policy, chosen via
+    """Run a trained policy - robomimic diffusion policy or fm flow policy, chosen via
     --ood_detection_metric - in an Isaac Lab environment."""
 
     import gymnasium as gym
@@ -396,7 +457,7 @@ def main():
     # Acquire device
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
 
-    # optional reference loss distribution (see diffusion_loss.py) to score live losses
+    # optional reference loss distribution (see get_diffloss_diffdagger.py) to score live losses
     # against via CDF percentile
     loss_cdf = None
     if args_cli.loss_range is not None and args_cli.ood_detection_metric == "diffdaggerloss":
@@ -416,7 +477,7 @@ def main():
         if args_cli.fm_checkpoint is None:
             raise ValueError("--fm_checkpoint is required when --ood_detection_metric=density")
 
-        policy_backbone = "gloves"
+        policy_backbone = "fm"
 
     elif args_cli.ood_detection_metric == "diffdaggerloss":
         if args_cli.dp_checkpoint is None:
@@ -436,15 +497,21 @@ def main():
     for trial in range(args_cli.num_rollouts):
         print(f"[INFO] Starting trial {trial}")
 
-        if policy_backbone == "gloves":
+        if policy_backbone == "fm":
             policy = DiTPolicy.from_pretrained(args_cli.fm_checkpoint)
             policy.to(device)
             policy.eval()
 
-            # TODO: obs_history needs to come from a real rollout loop (see
-            # run_gloves_fm_policy's docstring) - not wired up yet, so this call always
-            # raises NotImplementedError before obs_history=None would matter.
-            terminated, traj = run_gloves_fm_policy(policy, None, device, teleop_interface, not_blend)
+            # Build an initial n_obs_steps-long obs_history from the first observation,
+            # mirroring run_dp_policy's own history init (repeat the first obs to fill the
+            # window). TODO: once run_fm_policy grows a real rollout loop (see its
+            # docstring), obs_history should instead be threaded/updated step-to-step there.
+            obs_dict, _ = env.reset()
+            obs = copy.deepcopy(obs_dict["policy"])
+            obs = {k: torch.squeeze(obs[k]) for k in DEFAULT_STATE_KEYS}
+            obs_history = deque([obs] * policy.config.n_obs_steps, maxlen=policy.config.n_obs_steps)
+
+            terminated, traj = run_fm_policy(policy, obs_history, device, teleop_interface, not_blend)
 
         elif policy_backbone == "diffusion_policy":
 

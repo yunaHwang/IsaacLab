@@ -18,7 +18,7 @@ DEFAULT_OBS_KEYS = ["eef_pos", "gripper_pos", "object", "eef_quat"]
 
 
 # TODO. should implement only pure state, too.
-def compute_diffusion_loss(policy, obs_seq, action, device=None):
+def compute_diffusion_loss(policy, obs_seq, action, noise=None, timesteps=None, device=None):
     """Score a candidate action under a robomimic DiffusionPolicyUNet's noise-prediction
     objective, without training or modifying robomimic's installed source.
 
@@ -26,10 +26,14 @@ def compute_diffusion_loss(policy, obs_seq, action, device=None):
     encoding -> add noise to the action -> predict the noise -> MSE), skipping the
     optimizer/EMA update, so it can be called as a pure "how OOD is this state-conditioned action" score.
 
-    This is a single (noise, timestep) draw, no averaging. For a fixed dataset of
-    (obs, action) pairs (see compute_dataset_loss_distribution below) one draw per pair is
-    enough. For scoring the same live action repeatedly (diffdagger's Nb-sample averaging,
-    e.g. Nb=512), call this in a loop and average externally - see run_policy.py.
+    This is a single (noise, timestep) draw per batch element, no averaging - unless the
+    caller passes a batch of several. For a fixed dataset of (obs, action) pairs (see
+    compute_dataset_loss_distribution below) one draw per pair is enough. For scoring the
+    same live action repeatedly (diffdagger's Nb-sample averaging, e.g. Nb=512), a caller can
+    either loop this and average externally, or - the preferred way, see
+    diffdagger_loss_state_ood in state_ood_signal_impl.py - expand obs_seq/action to a
+    batch of Nb copies of the same (obs, action) pair and pass Nb explicit `noise`/
+    `timesteps` in, scoring all Nb draws in one vectorized call instead of Nb separate ones.
 
     Note: the diffusion policy scores an action *chunk* of length Tp conditioned on To
     past observations, not a single timestep. A single-step action gets tiled across
@@ -42,6 +46,14 @@ def compute_diffusion_loss(policy, obs_seq, action, device=None):
         obs_seq (dict): {key: tensor [B, To, ...]} - windowed observation history in the
             same format the policy itself consumes.
         action (tensor): [Da], [B, Da], or [B, Tp, Da].
+        noise (tensor, optional): [B, Tp, Da] pre-drawn noise to add to `action`. If None
+            (default), drawn fresh here via torch.randn, same as before this parameter
+            existed - pass this explicitly to control/inspect the draw from the call site
+            instead of it happening silently inside this function.
+        timesteps (tensor, optional): [B] pre-drawn diffusion timesteps (long, each in
+            [0, num_train_timesteps)). If None (default), drawn fresh here via
+            torch.randint, same as before - pass this explicitly for the same reason as
+            `noise` above.
 
     Returns:
         tensor [B]: noise-prediction MSE loss per batch element, for this one draw.
@@ -80,10 +92,12 @@ def compute_diffusion_loss(policy, obs_seq, action, device=None):
             f"expected action shape ({B},{Tp},{action_dim}), got {tuple(action.shape)}"
         )
 
-        noise = torch.randn(action.shape, device=device)
-        timesteps = torch.randint(
-            0, algo.noise_scheduler.config.num_train_timesteps, (B,), device=device
-        ).long()
+        if noise is None:
+            noise = torch.randn(action.shape, device=device)
+        if timesteps is None:
+            timesteps = torch.randint(
+                0, algo.noise_scheduler.config.num_train_timesteps, (B,), device=device
+            ).long()
         noisy_action = algo.noise_scheduler.add_noise(action, noise, timesteps)
         noise_pred = nets["policy"]["noise_pred_net"](
             noisy_action, timesteps, global_cond=obs_cond
@@ -91,6 +105,21 @@ def compute_diffusion_loss(policy, obs_seq, action, device=None):
         loss = F.mse_loss(noise_pred, noise, reduction="none").mean(dim=(1, 2))  # [B]
 
     return loss
+
+
+def diffusion_action_shape(policy, device=None):
+    """(Tp, action_dim, num_train_timesteps, device) for a robomimic diffusion policy - the
+    handful of internal fields a caller needs to draw its own explicit (noise, timesteps)
+    batch for compute_diffusion_loss (see diffdagger_loss_state_ood in
+    state_ood_signal_impl.py), without reaching into `policy`/`algo` fields directly itself.
+    """
+    algo = policy.policy if hasattr(policy, "policy") else policy
+    return (
+        algo.algo_config.horizon.prediction_horizon,
+        algo.ac_dim,
+        algo.noise_scheduler.config.num_train_timesteps,
+        device or algo.device,
+    )
 
 
 def compute_dataset_loss_distribution(

@@ -74,6 +74,59 @@ def nonconformity_score_from_batch(
     return nonconformity_score(dit_flow.velocity_net, batch[action_key], context)
 
 
+def _stack_obs_history_state(
+    obs_history, state_keys: list[str], device
+) -> torch.Tensor:
+    """Concatenate `state_keys` from each step of a live `obs_history` (e.g. run_policy.py's
+    `obs_history` deque) into a [1, To, state_dim] proprioceptive state batch, matching the
+    `observation.state` shape DiTFlowModel's encoders expect."""
+    return torch.stack(
+        [torch.cat([torch.as_tensor(o[k]).flatten() for k in state_keys]) for o in obs_history],
+        dim=0,
+    ).unsqueeze(0).to(device=device, dtype=torch.float32)  # [1, To, state_dim]
+
+
+@torch.no_grad()
+def generate_action_chunk(
+    dit_flow: DiTFlowModel,
+    obs_history,
+    state_keys: list[str] = DEFAULT_STATE_KEYS,
+    device=None,
+    full_chunk: bool = False,
+) -> torch.Tensor:
+    """Generate the trained GLOVES flow model's own action chunk from a live `obs_history`
+    (e.g. run_policy.py's `obs_history` deque), by actually running F_theta forward
+    (conditional_sample's ODE solve) instead of scoring an existing action against it (see
+    compute_density_score below for that).
+
+    Args:
+        dit_flow: the trained, frozen GLOVES flow model (DiTPolicy.dit_flow).
+        obs_history: iterable of `n_obs_steps` obs dicts, each mapping every key in
+            `state_keys` to a tensor for that step (same shape/keys as run_policy.py's
+            per-step `obs`).
+        state_keys: obs dict keys to concatenate into the proprioceptive state vector fed
+            to DiTFlowModel's state encoder -- must match the keys the checkpoint was
+            trained on.
+        device: device to run on. Defaults to dit_flow's own device.
+        full_chunk: if True, return F_theta's full (B, horizon, ac_dim) sample -- the shape
+            compute_density_score's ac_chunk assert expects, and what the paper's z_hat is
+            defined over -- via DiTFlowModel.conditional_sample directly, skipping
+            DiTFlowModel.generate_actions' truncation to n_action_steps. If False (default),
+            return the (B, n_action_steps, ac_dim) slice meant for env execution, matching
+            DiTFlowModel.generate_actions' own return value.
+
+    Returns:
+        tensor [1, horizon, ac_dim] if full_chunk else [1, n_action_steps, ac_dim].
+    """
+    device = device or next(dit_flow.parameters()).device
+    state = _stack_obs_history_state(obs_history, state_keys, device)
+    if not full_chunk:
+        return dit_flow.generate_actions({OBS_STATE: state})
+
+    context = dit_flow._prepare_context_tokens({OBS_STATE: state})
+    return dit_flow.conditional_sample(context=context)
+
+
 @torch.no_grad()
 def compute_density_score(
     dit_flow: DiTFlowModel,
@@ -104,10 +157,7 @@ def compute_density_score(
     """
     device = device or next(dit_flow.parameters()).device
 
-    state = torch.stack(
-        [torch.cat([torch.as_tensor(o[k]).flatten() for k in state_keys]) for o in obs_history],
-        dim=0,
-    ).unsqueeze(0).to(device=device, dtype=torch.float32)  # [1, To, state_dim]
+    state = _stack_obs_history_state(obs_history, state_keys, device)
     context = dit_flow._prepare_context_tokens({OBS_STATE: state})
 
     ac_chunk = dit_flow.velocity_net.ac_chunk
