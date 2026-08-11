@@ -1,12 +1,12 @@
-"""This script converts IsaacLab HDF5 datasets into LeRobot Dataset v2 format.
+# """This script converts IsaacLab HDF5 datasets into LeRobot Dataset v2 format.
 
-Since LeRobot is evolving rapidly, compatibility with the latest LeRobot versions is not guaranteed.
-Please install the following specific versions of the dependencies:
+# Since LeRobot is evolving rapidly, compatibility with the latest LeRobot versions is not guaranteed.
+# Please install the following specific versions of the dependencies:
 
-pip install lerobot==0.3.3
-pip install numpy==1.26.0
+# pip install lerobot==0.3.3
+# pip install numpy==1.26.0
 
-"""
+# """
 
 import argparse
 import os
@@ -21,7 +21,7 @@ parser.add_argument("--task_name", type=str, default=None, help="Name of the tas
 parser.add_argument(
     "--task_type",
     type=str,
-    default=None,
+    default="keyboard",
     help=(
         "Specify task type. If your dataset is recorded with keyboard/gamepad, you should set it to"
         " 'keyboard'/'gamepad', otherwise not to set it and keep default value None."
@@ -30,7 +30,7 @@ parser.add_argument(
 parser.add_argument(
     "--repo_id",
     type=str,
-    default="EverNorif/so101_test_orange_pick",
+    default="ID/visuomotor-based", #NOTE - change here
     help="Repository ID",
 )
 parser.add_argument(
@@ -128,19 +128,57 @@ def add_episode(
     # skip the first 5 frames
     for frame_index in tqdm(range(5, num_frames), desc="Processing each frame"):
         frame = env.cfg.build_lerobot_frame(episode_list[frame_index], dataset_cfg)
-        predefined_task = frame.pop("task")
-        dataset.add_frame(frame=frame, task=predefined_task if task is None else task)
+        # print("frame keys", frame.keys())
+
+        predefined_task = frame["task"]   # don't pop!
+
+        # do this for 0.3.3
+        # predefined_task = frame.pop("task")
+        
+        dataset.add_frame(frame)
+
+        # do this for 0.3.3
+        #dataset.add_frame(frame=frame, task=predefined_task if task is None else task)
     return True
 
 
 def convert_isaaclab_to_lerobot():
+    import isaaclab_mimic.envs
+
+    print("Mimic envs:")
+    for name in gym.registry.keys():
+        if "Mimic" in name:
+            print(name)
+    
     """automatically build features and dataset"""
     env_cfg = parse_env_cfg(args_cli.task_name, device=args_cli.device, num_envs=1)
+
+
+    # print("[OBS] env_cfg.observations ", env_cfg.observations)
+    # print("policy too, ", env_cfg.observations.policy)
+
     task_type = get_task_type(args_cli.task_name, args_cli.task_type)
     # env_cfg.use_teleop_device(task_type)
     env_cfg.teleop_devices = task_type
 
     env: ManagerBasedRLEnv | DirectRLEnv = gym.make(args_cli.task_name, cfg=env_cfg).unwrapped
+    # import pdb
+    # import traceback
+
+    # try:
+    #     env = gym.make(args_cli.task_name, cfg=env_cfg, render_mode="rgb_array").unwrapped
+    # except Exception as e:
+    #     print("Exception type:", type(e))
+    #     print("Exception:", e)
+    #     print("Cause:", repr(e.__cause__))
+    #     print("Context:", repr(e.__context__))
+
+    #     if e.__cause__:
+    #         traceback.print_exception(type(e.__cause__), e.__cause__, e.__cause__.__traceback__)
+    #     elif e.__context__:
+    #         traceback.print_exception(type(e.__context__), e.__context__, e.__context__.__traceback__)
+
+    #     raise
 
     from types import MethodType
 
@@ -242,9 +280,12 @@ def convert_isaaclab_to_lerobot():
 
     def build_lerobot_frame(self, frame_data, dataset_cfg):
 
+        import numpy as np
+
         data = frame_data.data
 
         obs = data["obs"]
+        # print("obs keys, ", obs.keys())
         actions = data["actions"]
 
         frame = {}
@@ -254,6 +295,46 @@ def convert_isaaclab_to_lerobot():
 
         # Robot proprioception
         frame["observation.state"] = to_numpy(obs["joint_pos"])
+
+        # NOTE: yuna add - image
+        frame["observation.images.table_cam"] = (
+            obs["table_cam"][0]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+        frame["observation.images.wrist_cam"] = (
+            obs["wrist_cam"][0]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+        # frame["observation.images.table_cam"] = to_numpy(obs["table_cam"])
+        # frame["observation.images.wrist_cam"] = to_numpy(obs["wrist_cam"])
+
+        # table_img = obs["table_cam"]
+
+        # table_img = obs["table_cam"]
+
+        # print(type(table_img))
+        # print(len(table_img))
+        # print(type(table_img[0]))
+        # print(getattr(table_img[0], "shape", None))
+        # print(getattr(table_img[0], "dtype", None))
+
+
+        # if torch.is_tensor(table_img):
+        #     table_img = table_img.detach().cpu().numpy()
+
+        # frame["observation.images.table_cam"] = table_img.astype(np.uint8)
+
+        # wrist_img = obs["wrist_cam"]
+        # if torch.is_tensor(wrist_img):
+        #     wrist_img = wrist_img.detach().cpu().numpy()
+
+        # frame["observation.images.wrist_cam"] = wrist_img.astype(np.uint8)
 
         # LeRobot task description
         frame["task"] = "stack cubes"
@@ -285,11 +366,14 @@ def convert_isaaclab_to_lerobot():
 
     dataset_cfg.features = build_feature_from_env(env, dataset_cfg)
 
+    #print("keys", dataset_cfg.features.keys())
+
     dataset = LeRobotDataset.create(
         repo_id=dataset_cfg.repo_id,
         fps=dataset_cfg.fps,
         robot_type=dataset_cfg.robot_type,
         features=dataset_cfg.features,
+        root='./lerobot_dataset_0810/ID-visuomotor-based' # NOTE - change here!
     )
 
     if args_cli.hdf5_files is None:
@@ -301,28 +385,117 @@ def convert_isaaclab_to_lerobot():
         ]
 
     now_episode_index = 0
+
     for hdf5_id, hdf5_file in enumerate(hdf5_files_list):
-        print(f"[{hdf5_id+1}/{len(hdf5_files_list)}] Processing hdf5 file: {hdf5_file}")
+        print(
+            f"[{hdf5_id+1}/{len(hdf5_files_list)}] "
+            f"Processing hdf5 file: {hdf5_file}"
+        )
 
         dataset_file_handler = HDF5DatasetFileHandler()
         dataset_file_handler.open(hdf5_file)
 
         episode_names = dataset_file_handler.get_episode_names()
         print(f"Found {len(episode_names)} episodes: {episode_names}")
-        for episode_name in tqdm(episode_names, desc="Processing each episode"):
-            episode = dataset_file_handler.load_episode(episode_name, device=args_cli.device)
+
+        for episode_name in tqdm(
+            episode_names,
+            desc="Processing each episode"
+        ):
+            episode = dataset_file_handler.load_episode(
+                episode_name,
+                device=args_cli.device
+            )
+
             if not episode.success:
-                print(f"Episode {episode_name} is not successful, skip it")
+                print(
+                    f"Episode {episode_name} "
+                    f"is not successful, skip it"
+                )
                 continue
-            valid = add_episode(dataset, episode, env, dataset_cfg, args_cli.task_description)
+
+            valid = add_episode(
+                dataset,
+                episode,
+                env,
+                dataset_cfg,
+                args_cli.task_description
+            )
+
             if valid:
                 now_episode_index += 1
                 dataset.save_episode()
-                print(f"Saving episode {now_episode_index} successfully")
+                print(
+                    f"Saving episode "
+                    f"{now_episode_index} successfully"
+                )
             else:
                 dataset.clear_episode_buffer()
 
         dataset_file_handler.close()
+
+    # IMPORTANT: finalize ONCE, after all episodes
+    print("Finalizing LeRobot dataset...")
+    dataset.finalize()
+    print("Dataset finalized.")
+
+    from pathlib import Path
+
+    root = Path(dataset.root)
+
+    for p in root.rglob("*.parquet"):
+        print(p)
+
+    # now_episode_index = 0
+    # for hdf5_id, hdf5_file in enumerate(hdf5_files_list):
+    #     print(f"[{hdf5_id+1}/{len(hdf5_files_list)}] Processing hdf5 file: {hdf5_file}")
+
+    #     dataset_file_handler = HDF5DatasetFileHandler()
+    #     dataset_file_handler.open(hdf5_file)
+
+    #     episode_names = dataset_file_handler.get_episode_names()
+    #     print(f"Found {len(episode_names)} episodes: {episode_names}")
+    #     for episode_name in tqdm(episode_names, desc="Processing each episode"):
+    #         episode = dataset_file_handler.load_episode(episode_name, device=args_cli.device)
+    #         if not episode.success:
+    #             print(f"Episode {episode_name} is not successful, skip it")
+    #             continue
+    #         valid = add_episode(dataset, episode, env, dataset_cfg, args_cli.task_description)
+    #         if valid:
+    #             now_episode_index += 1
+    #             dataset.save_episode()                
+
+    #             print(f"Saving episode {now_episode_index} successfully")
+    #         else:
+    #             dataset.clear_episode_buffer()
+
+    #     dataset_file_handler.close()
+
+
+    #     # adding for 0.4.4
+    #     print("Closing parquet writer...")
+    #     # dataset._close_writer()
+    #     # dataset.finalize()
+
+    #     # dataset_file_handler.close()
+
+    #     from pathlib import Path
+
+    #     print("Finished processing episodes")
+
+    #     from pathlib import Path
+
+    #     root = Path(dataset.root)
+
+    #     for p in root.rglob("*.parquet"):
+    #         print(p)
+
+    
+    # print("Finalizing LeRobot dataset...")
+    # dataset.finalize()
+    # print("Dataset finalized.")
+
+
 
     if args_cli.push_to_hub:
         dataset.push_to_hub()
