@@ -19,6 +19,16 @@ conformal calibration/thresholding downstream of this script, rather than comput
 Intended use: run over a calibration set of expert action chunks to build up scores for
 conformal-prediction thresholding, or over agent-proposed action chunks at inference time
 to flag OOD actions (large s(x) -> maps to a low-likelihood region of the Gaussian prior).
+
+Standalone usage: run this file directly to sweep a LeRobotDataset and save the resulting
+non-conformity scores to a CSV (a calibration-set score distribution for
+cf_prediction_score_state_ood in ood_signal.py):
+
+    python get_nonconformity_gloves.py --checkpoint gloves_model.pth \
+        --dataset my_dataset_repo_id --save-to-file --save-file-name nonconformity_scores.csv
+
+Optional flags: --dataset-root (local root, if --dataset isn't a hub repo id), --device
+(default: cpu), --batch-size (default: 32). See main() below for the full list.
 """
 
 import argparse
@@ -137,7 +147,7 @@ def compute_density_score(
 ) -> torch.Tensor:
     """Score a live action against GLOVES' density non-conformity score (Eq. 6), built from a
     live `obs_history` (e.g. run_policy.py's `obs_history` deque) instead of a LeRobotDataset
-    batch. Mirrors get_diffloss_diffdagger.compute_diffusion_loss's role for the density
+    batch. Mirrors get_loss_diffdagger.compute_diffusion_loss's role for the density
     metric: run_policy.py calls this once per step to score the live human action.
 
     Args:

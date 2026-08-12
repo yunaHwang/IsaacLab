@@ -36,6 +36,12 @@ physical/robot units, normalize it before calling compute_density_score.
 The observation batch must also already be in the representation expected
 by the policy (including any state/image normalization handled by your
 LeRobot preprocessing pipeline).
+
+Standalone usage: NONE - unlike get_loss_diffdagger.py/get_nonconformity_gloves.py,
+this file has no main()/argparse/`if __name__ == "__main__":` entry point. It's library code
+only, imported by ood_signal.py's multitask_dit_density. Add a dataset-sweep CLI here
+(mirroring get_nonconformity_gloves.py's main()) if you need an offline calibration
+score distribution for MultiTaskDiTPolicy.
 """
 
 from __future__ import annotations

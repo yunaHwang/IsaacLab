@@ -1,11 +1,17 @@
 """Diffusion-policy noise-prediction loss utilities.
 
 Deliberately has no isaaclab imports, so it runs standalone off an hdf5 dataset without
-booting Isaac Sim. Run this file directly to compute an in-distribution loss range from a
-dataset, for later use as run_policy.py's --loss_range:
+booting Isaac Sim.
 
-    python diffusion_loss.py --checkpoint model.pth --hdf5_dataset data.hdf5 \
+Standalone usage: run this file directly to sweep an hdf5 dataset's (obs, action) pairs and
+save an in-distribution loss-distribution CSV, for later use as run_policy_dp.py's
+--loss_state_range/--loss_action_range:
+
+    python get_loss_diffdagger.py --checkpoint model.pth --hdf5_dataset data.hdf5 \
         --save_file_name losses
+
+Optional flags: --obs_keys (default: eef_pos gripper_pos object eef_quat), --observation_horizon
+(default: 2), --device (default: auto-detect CUDA). See main() below for the full list.
 """
 
 import numpy as np
@@ -17,7 +23,6 @@ import robomimic.utils.tensor_utils as TensorUtils
 DEFAULT_OBS_KEYS = ["eef_pos", "gripper_pos", "object", "eef_quat"]
 
 
-# TODO. should implement only pure state, too.
 def compute_diffusion_loss(policy, obs_seq, action, noise=None, timesteps=None, device=None):
     """Score a candidate action under a robomimic DiffusionPolicyUNet's noise-prediction
     objective, without training or modifying robomimic's installed source.
@@ -31,7 +36,7 @@ def compute_diffusion_loss(policy, obs_seq, action, noise=None, timesteps=None, 
     compute_dataset_loss_distribution below) one draw per pair is enough. For scoring the
     same live action repeatedly (diffdagger's Nb-sample averaging, e.g. Nb=512), a caller can
     either loop this and average externally, or - the preferred way, see
-    diffdagger_loss_state_ood in state_ood_signal_impl.py - expand obs_seq/action to a
+    dp_loss in ood_signal.py - expand obs_seq/action to a
     batch of Nb copies of the same (obs, action) pair and pass Nb explicit `noise`/
     `timesteps` in, scoring all Nb draws in one vectorized call instead of Nb separate ones.
 
@@ -110,8 +115,8 @@ def compute_diffusion_loss(policy, obs_seq, action, noise=None, timesteps=None, 
 def diffusion_action_shape(policy, device=None):
     """(Tp, action_dim, num_train_timesteps, device) for a robomimic diffusion policy - the
     handful of internal fields a caller needs to draw its own explicit (noise, timesteps)
-    batch for compute_diffusion_loss (see diffdagger_loss_state_ood in
-    state_ood_signal_impl.py), without reaching into `policy`/`algo` fields directly itself.
+    batch for compute_diffusion_loss (see dp_loss in
+    ood_signal.py), without reaching into `policy`/`algo` fields directly itself.
     """
     algo = policy.policy if hasattr(policy, "policy") else policy
     return (
