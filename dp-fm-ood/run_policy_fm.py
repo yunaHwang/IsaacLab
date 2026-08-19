@@ -90,6 +90,21 @@ parser.add_argument(
     "task-conditioning.",
 )
 
+parser.add_argument(
+    "--spacemouse_bridge_host", type=str, default="127.0.0.1",
+    help="Host spacemouse_bridge.py is listening on (after SSH -R port-forwarding). Only "
+    "used as a fallback when no SpaceMouse is found on local HID - see spacemouse_bridge.py.",
+)
+parser.add_argument(
+    "--spacemouse_bridge_port", type=int, default=6060,
+    help="Port spacemouse_bridge.py is listening on.",
+)
+parser.add_argument(
+    "--spacemouse_bridge_authkey", type=str, default="spacemouse-ipc",
+    help="Shared secret for the multiprocessing.connection handshake - must match "
+    "spacemouse_bridge.py's --authkey.",
+)
+
 parser.add_argument("--horizon", type=int, default=500, help="Step horizon of each rollout.")
 parser.add_argument("--num_rollouts", type=int, default=10, help="Number of rollouts to run.")
 parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -108,9 +123,61 @@ import random
 import gymnasium as gym
 import numpy as np
 import torch
+from scipy.spatial.transform import Rotation
 
 from isaaclab.devices import Se3SpaceMouse, Se3SpaceMouseCfg
 from isaaclab_tasks.utils import parse_env_cfg
+
+
+class NetworkSe3SpaceMouse:
+    """Reads a SpaceMouse over spacemouse_bridge.py instead of local HID hardware - for
+    when the physical device is on your client machine but this script runs on a remote SSH
+    server that has no direct access to it. See spacemouse_bridge.py's module docstring for
+    setup (run it on your client machine, then `ssh -R <port>:localhost:<port>` when
+    connecting to this server).
+
+    Drop-in replacement for isaaclab.devices.spacemouse.Se3SpaceMouse's public interface
+    (advance/reset/__str__) as used by this script. pos_sensitivity/rot_sensitivity are
+    applied here (server-side, from Se3SpaceMouseCfg) rather than by the bridge, so retuning
+    sensitivity doesn't require restarting the bridge - see spacemouse_bridge.py's docstring.
+    """
+
+    def __init__(self, cfg, host, port, authkey):
+        self.pos_sensitivity = cfg.pos_sensitivity
+        self.rot_sensitivity = cfg.rot_sensitivity
+        self.gripper_term = cfg.gripper_term
+        self._sim_device = cfg.sim_device
+        self._conn = Client((host, port), authkey=authkey.encode())
+
+    def __str__(self) -> str:
+        msg = f"Spacemouse Controller for SE(3): {self.__class__.__name__} (via network bridge)\n"
+        msg += "\t----------------------------------------------\n"
+        msg += "\tRight button: reset command\n"
+        msg += "\tLeft button: toggle gripper command (open/close)\n"
+        msg += "\tMove mouse laterally: move arm horizontally in x-y plane\n"
+        msg += "\tMove mouse vertically: move arm vertically\n"
+        msg += "\tTwist mouse about an axis: rotate arm about a corresponding axis"
+        return msg
+
+    def reset(self):
+        self._conn.send({"cmd": "reset"})
+        self._conn.recv()
+
+    def advance(self) -> torch.Tensor:
+        self._conn.send({"cmd": "advance"})
+        response = self._conn.recv()
+        if not response.get("ok", False):
+            raise RuntimeError(f"spacemouse_bridge error: {response.get('error')}")
+
+        delta_pos = np.asarray(response["delta_pos"]) * self.pos_sensitivity
+        delta_rot = np.asarray(response["delta_rot"]) * self.rot_sensitivity
+        rot_vec = Rotation.from_euler("XYZ", delta_rot).as_rotvec()
+        command = np.concatenate([delta_pos, rot_vec])
+        if self.gripper_term:
+            gripper_value = -1.0 if response["close_gripper"] else 1.0
+            command = np.append(command, gripper_value)
+
+        return torch.tensor(command, dtype=torch.float32, device=self._sim_device)
 
 
 def run_gloves_policy(fm_policy, obs_history, device, teleop_interface, not_blend=True):
@@ -184,6 +251,7 @@ def run_gloves_policy(fm_policy, obs_history, device, teleop_interface, not_blen
     # [7]: [x, y, z, rx, ry, rz, gripper] delta-pose command, already on `device`
     # https://isaac-sim.github.io/IsaacLab/main/source/api/lab/isaaclab.devices.html
     user_action = teleop_interface.advance()
+    print(f"[SpaceMouse] raw 7-DoF action: {user_action.tolist()}")
 
     score = gloves_density(fm_policy.dit_flow, obs_history, user_action)
     print(f"[ACTION] density non-conformity score for current human action: {score.item():.4f}")
@@ -249,15 +317,15 @@ def run_multitask_ditpolicy(
     )
     print(policy_actions)
 
-    if "state_ood_loss" in response:
-        print(f"[state OOD] MultiTaskDiT loss for model's own action: {response['state_ood_loss']:.4f}")
-    elif "state_ood_loss_error" in response:
-        print(f"[state OOD] MultiTaskDiT loss errored server-side: {response['state_ood_loss_error']}")
+    # if "state_ood_loss" in response:
+    #     print(f"[state OOD] MultiTaskDiT loss for model's own action: {response['state_ood_loss']:.4f}")
+    # elif "state_ood_loss_error" in response:
+    #     print(f"[state OOD] MultiTaskDiT loss errored server-side: {response['state_ood_loss_error']}")
 
-    if "state_ood_density" in response:
-        print(f"[state OOD] MultiTaskDiT density for model's own action: {response['state_ood_density']:.4f}")
-    elif "state_ood_density_error" in response:
-        print(f"[state OOD] MultiTaskDiT density errored server-side: {response['state_ood_density_error']}")
+    # if "state_ood_density" in response:
+    #     print(f"[state OOD] MultiTaskDiT density for model's own action: {response['state_ood_density']:.4f}")
+    # elif "state_ood_density_error" in response:
+    #     print(f"[state OOD] MultiTaskDiT density errored server-side: {response['state_ood_density_error']}")
 
     # ---------------------------------------------------------
     # Human action
@@ -273,6 +341,7 @@ def run_multitask_ditpolicy(
             )
 
         user_action = teleop_interface.advance()
+        print(f"[SpaceMouse] raw 7-DoF action: {user_action.tolist()}")
 
         # TODO: scoring the live human action's OOD loss/density against the
         # server-owned model isn't wired up yet - would need a dedicated server "cmd"
@@ -382,12 +451,31 @@ def main():
     not_blend = True if not args_cli.blend else False
 
     # Wire up an input device - only needed for action blending (--blend), which reads the
-    # live human action via teleop_interface.advance(). Skipped when not_blend=True (the
-    # default) so this script runs without a physically-connected SpaceMouse, e.g. over SSH
-    # where the device is on the client side, not this server.
+    # live human action via teleop_interface.advance(). Skipped entirely when not_blend=True
+    # (the default). When blending IS requested, try the local HID SpaceMouse first (the
+    # normal case when this script runs on the same machine the device is plugged into); if
+    # none is found (e.g. this script is running on a remote SSH workstation and the
+    # SpaceMouse is on your local client machine instead), fall back to spacemouse_bridge.py
+    # over the network - see that file's module docstring for the one-time SSH -R setup.
     teleop_interface = None
     if not not_blend:
-        teleop_interface = Se3SpaceMouse(Se3SpaceMouseCfg(sim_device=device))
+        cfg = Se3SpaceMouseCfg(sim_device=device)
+        try:
+            teleop_interface = Se3SpaceMouse(cfg)
+        except OSError:
+            print(
+                "[INFO] No local SpaceMouse found - falling back to the network bridge at "
+                f"{args_cli.spacemouse_bridge_host}:{args_cli.spacemouse_bridge_port}. Run "
+                "spacemouse_bridge.py on your client machine and forward the port with "
+                "`ssh -R <port>:localhost:<port>` if you haven't already - see "
+                "spacemouse_bridge.py's module docstring."
+            )
+            teleop_interface = NetworkSe3SpaceMouse(
+                cfg,
+                host=args_cli.spacemouse_bridge_host,
+                port=args_cli.spacemouse_bridge_port,
+                authkey=args_cli.spacemouse_bridge_authkey,
+            )
         print(teleop_interface)
 
     # Run policy on live actions input from Isaac Lab

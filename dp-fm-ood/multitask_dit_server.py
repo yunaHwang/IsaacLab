@@ -86,7 +86,7 @@ def main():
         "must match run_policy_fm.py's --mdit_server_authkey.",
     )
     parser.add_argument(
-        "--num_samples", type=int, default=512,
+        "--num_samples", type=int, default=32,
         help="Nb for the diffdagger-style loss computed alongside each action (see "
         "ood_signal.multitask_dit_loss).",
     )
@@ -179,6 +179,15 @@ def main():
                             f"density={response.get('state_ood_density')}"
                         )
                         conn.send(response)
+
+                        # multitask_dit_loss batches num_samples copies of both camera
+                        # images through the model in one forward pass - PyTorch's caching
+                        # allocator keeps that peak-sized block reserved for reuse rather
+                        # than returning it to the OS, so without this the process's VRAM
+                        # footprint ratchets up to (and stays at) that peak instead of
+                        # settling back down between steps, starving other GPU users (e.g.
+                        # the Isaac Lab viewport) even at idle.
+                        torch.cuda.empty_cache()
 
                     elif cmd == "close":
                         conn.send({"ok": True})
