@@ -21,11 +21,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ood_signal_baseline_papers.reconstruction_loss.get_loss_diffdagger import (
-    compute_diffusion_loss,
-    diffusion_action_shape,
-)
-
 
 # -- Utility functions --
 def _expand_to_batch(tensor, n):
@@ -54,6 +49,11 @@ def dp_loss(policy, state, action, num_samples=512):
     Returns:
         scalar tensor: mean noise-prediction MSE loss over num_samples draws.
     """
+    from ood_signal_baseline_papers.reconstruction_loss.get_loss_diffdagger import (
+        compute_diffusion_loss,
+        diffusion_action_shape,
+    )
+
     Nb = num_samples
     Tp, action_dim, num_train_timesteps, device = diffusion_action_shape(policy)
 

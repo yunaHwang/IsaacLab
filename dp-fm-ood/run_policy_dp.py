@@ -44,7 +44,7 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Evaluate a robomimic diffusion policy for Isaac Lab environment.")
 
 parser.add_argument("--task", type=str, required=True, help="Name of the environment.")
-parser.add_argument("--device", type=str, default="cpu")
+# parser.add_argument("--device", type=str, default="cpu")
 parser.add_argument(
     "--disable_fabric", action="store_true", default=False,
     help="Disable fabric and use USD I/O operations."
@@ -98,6 +98,7 @@ simulation_app = app_launcher.app
 
 import copy
 import random
+import time
 
 import gymnasium as gym
 import numpy as np
@@ -344,33 +345,39 @@ def main():
         print(f"[INFO] Loaded reference action-loss CDF from {args_cli.loss_action_range} (range: {loss_action_cdf.min:.4f} - {loss_action_cdf.max:.4f})")
 
     # Wire up an input device
-    teleop_interface = Se3SpaceMouse(Se3SpaceMouseCfg(sim_device=device))
-    print(teleop_interface)
+    # teleop_interface = Se3SpaceMouse(Se3SpaceMouseCfg(sim_device=device))
+    # print(teleop_interface)
 
-    not_blend = True if not args_cli.blend else False
+    # not_blend = True if not args_cli.blend else False
 
-    # Run policy on live actions input from Isaac Lab
-    results = []
-    for trial in range(args_cli.num_rollouts):
-        print(f"[INFO] Starting trial {trial}")
+    # # Run policy on live actions input from Isaac Lab
+    # results = []
+    # for trial in range(args_cli.num_rollouts):
+    #     print(f"[INFO] Starting trial {trial}")
 
-        policy, _ = FileUtils.policy_from_checkpoint(ckpt_path=args_cli.dp_checkpoint, device=device)
+    #     policy, _ = FileUtils.policy_from_checkpoint(ckpt_path=args_cli.dp_checkpoint, device=device)
 
-        terminated, traj = run_dp_policy(
-            policy, env, success_term, args_cli.horizon, device,
-            teleop_interface=teleop_interface,
-            loss_state_cdf=loss_state_cdf,
-            loss_action_cdf=loss_action_cdf,
-            not_blend=not_blend,
-        )
+    #     terminated, traj = run_dp_policy(
+    #         policy, env, success_term, args_cli.horizon, device,
+    #         teleop_interface=teleop_interface,
+    #         loss_state_cdf=loss_state_cdf,
+    #         loss_action_cdf=loss_action_cdf,
+    #         not_blend=not_blend,
+    #     )
 
-        results.append(terminated)
-        print(f"[INFO] Trial {trial}: {terminated}\n")
-        #print("traj, ", traj)
+    #     results.append(terminated)
+    #     print(f"[INFO] Trial {trial}: {terminated}\n")
+    #     #print("traj, ", traj)
 
-    print(f"\nSuccessful trials: {results.count(True)}, out of {len(results)} trials")
-    print(f"Success rate: {results.count(True) / len(results)}")
-    print(f"Trial Results: {results}\n")
+    # print(f"\nSuccessful trials: {results.count(True)}, out of {len(results)} trials")
+    # print(f"Success rate: {results.count(True) / len(results)}")
+    # print(f"Trial Results: {results}\n")
+
+    # Keep the sim window open for ~30 seconds
+    start_time = time.time()
+    while simulation_app.is_running() and (time.time() - start_time) < 30.0:
+        print("[INFO]: Running...")
+        simulation_app.update()
 
     env.close()
 

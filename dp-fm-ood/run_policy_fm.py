@@ -25,14 +25,14 @@ Args:
 # TODO - wire in conformal prediction and smoothness code in
 
 import argparse
-
-from ood_signal_baseline_papers.density.get_nonconformity_gloves import generate_action_chunk, DEFAULT_STATE_KEYS
+from multiprocessing.connection import Client
 
 from ood_signal import *
 
-# NOTE. to be run in separate isaaclab + lerobot environment
-from lerobot_policy_gloves.modeling_gloves import DiTPolicy
-from lerobot.policies.multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
+# NOTE: this script runs in Isaac Lab's env (yuna_env, Python 3.11). Neither the GLOVES
+# DiTPolicy nor LeRobot's MultiTaskDiTPolicy are importable here - they live in separate
+# conda envs and are reached over multiprocessing.connection instead. See
+# multitask_dit_server.py (and, once written, gloves_server.py) for the model-owning side.
 
 from isaaclab.app import AppLauncher
 
@@ -40,7 +40,7 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Evaluate an fm (flow-matching) policy for Isaac Lab environment.")
 
 parser.add_argument("--task", type=str, required=True, help="Name of the environment.")
-parser.add_argument("--device", type=str, default="cpu")
+# parser.add_argument("--device", type=str, default="cpu")
 parser.add_argument(
     "--disable_fabric", action="store_true", default=False,
     help="Disable fabric and use USD I/O operations.",
@@ -59,7 +59,7 @@ parser.add_argument(
 parser.add_argument("--blend", action='store_true')
 
 parser.add_argument(
-    "--num_samples", type=int, default=512,
+    "--num_samples", type=int, default=32, # was 512 and ran out of memory
     help="Number of (noise, t) draws to average the live fm diffdagger-style loss over "
     "(the fm analog of diffdagger's Nb in noise_estimation_loss_nb_infer). The live action is "
     "fixed for the duration of a step, so averaging multiple draws reduces the loss's variance.",
@@ -68,6 +68,26 @@ parser.add_argument(
 parser.add_argument(
     "--fm_checkpoint", type=str, required=True,
     help="Path or hub id of a trained fm policy checkpoint"
+)
+
+parser.add_argument(
+    "--mdit_server_host", type=str, default="127.0.0.1",
+    help="Host multitask_dit_server.py is listening on.",
+)
+parser.add_argument(
+    "--mdit_server_port", type=int, default=5555,
+    help="Port multitask_dit_server.py is listening on.",
+)
+parser.add_argument(
+    "--mdit_server_authkey", type=str, default="mdit-ipc",
+    help="Shared secret for the multiprocessing.connection handshake - must match "
+    "multitask_dit_server.py's --authkey.",
+)
+parser.add_argument(
+    "--task_instruction", type=str, default="stack cubes",
+    help="Language task label the MultiTaskDiT checkpoint was trained on (see the training "
+    "dataset's meta/tasks.parquet) - required for the server's preprocessor to tokenize "
+    "task-conditioning.",
 )
 
 parser.add_argument("--horizon", type=int, default=500, help="Step horizon of each rollout.")
@@ -83,7 +103,6 @@ args_cli = parser.parse_args()
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-import copy
 import random
 
 import gymnasium as gym
@@ -92,8 +111,6 @@ import torch
 
 from isaaclab.devices import Se3SpaceMouse, Se3SpaceMouseCfg
 from isaaclab_tasks.utils import parse_env_cfg
-
-from collections import deque
 
 
 def run_gloves_policy(fm_policy, obs_history, device, teleop_interface, not_blend=True):
@@ -122,6 +139,8 @@ def run_gloves_policy(fm_policy, obs_history, device, teleop_interface, not_blen
         terminated: Whether the rollout terminated.
         traj: The trajectory of the rollout.
     """
+    from ood_signal_baseline_papers.density.get_nonconformity_gloves import generate_action_chunk
+
     if not_blend:
         if obs_history is None:
             raise RuntimeError(
@@ -129,7 +148,7 @@ def run_gloves_policy(fm_policy, obs_history, device, teleop_interface, not_blen
                 "generate the fm policy's own action chunk."
             )
 
-        
+
         full_model_actions = generate_action_chunk(
             fm_policy.dit_flow, obs_history, device=device, full_chunk=True
         )
@@ -181,125 +200,64 @@ def run_gloves_policy(fm_policy, obs_history, device, teleop_interface, not_blen
 
 
 def run_multitask_ditpolicy(
-    policy,
-    obs_history,
-    device,
+    conn,
+    obs,
     teleop_interface=None,
     not_blend=True,
 ):
     """
-    Run the trained LeRobot MultiTaskDiTPolicy.
+    Run the trained LeRobot MultiTaskDiTPolicy via multitask_dit_server.py.
 
-    Checkpoint training schema:
-        observation.state              [9]
-        observation.images.table_cam   [3, 200, 200]
-        observation.images.wrist_cam   [3, 200, 200]
+    The server owns the model, the LeRobot preprocessor/postprocessor, and the
+    n_obs_steps window (see multitask_dit_server.py's module docstring -
+    `select_action` takes one raw timestep per call and pads/queues internally). This
+    function is therefore just an IPC round-trip for a single timestep's observation,
+    not a batch of history - `conn` must already have sent {"cmd": "reset"} once at the
+    start of the episode (see main()).
 
-    n_obs_steps = 2
-    n_action_steps = 24
-    action_dim = 7
+    Args:
+        conn: An open multiprocessing.connection.Client connection to
+            multitask_dit_server.py.
+        obs: A single timestep's observation dict, in make_lerobot_obs's format
+            (raw, un-batched - the server's preprocessor adds the batch dim).
+        teleop_interface: A device (e.g. Se3SpaceMouse) to read the live human action
+            from. Required when not_blend=False.
+        not_blend: If True, only the policy's own action chunk is returned/scored. If
+            False, the live human action is also read (its OOD scoring against the
+            server-owned model isn't wired up yet - see TODO below).
+
+    Returns:
+        policy_actions: The action chunk returned by the server (already
+            unnormalized/postprocessed).
+        user_action: The live teleop action, or None if not_blend=True.
     """
 
-    policy.eval()
+    conn.send({"cmd": "step", "obs": obs})
+    response = conn.recv()
 
-    obs_history = list(obs_history)
+    if not response.get("ok", False):
+        raise RuntimeError(f"multitask_dit_server error: {response.get('error')}")
 
-    # ---------------------------------------------------------
-    # Validate history
-    # ---------------------------------------------------------
-
-    if len(obs_history) != policy.config.n_obs_steps:
-        raise ValueError(
-            f"Expected {policy.config.n_obs_steps} observations, "
-            f"got {len(obs_history)}."
-        )
-
-    required_keys = [
-        "observation.state",
-        "observation.images.table_cam",
-        "observation.images.wrist_cam",
-    ]
-
-    for i, obs in enumerate(obs_history):
-        for key in required_keys:
-            if key not in obs:
-                raise KeyError(
-                    f"Observation {i} is missing {key!r}"
-                )
-
-    # ---------------------------------------------------------
-    # Stack temporal observations
-    # ---------------------------------------------------------
-
-    # [2, 9] -> [1, 2, 9]
-    state = torch.stack(
-        [
-            obs["observation.state"]
-            for obs in obs_history
-        ],
-        dim=0,
-    ).unsqueeze(0)
-
-    # [2, 3, H, W] -> [1, 2, 3, H, W]
-    table_cam = torch.stack(
-        [
-            obs["observation.images.table_cam"]
-            for obs in obs_history
-        ],
-        dim=0,
-    ).unsqueeze(0)
-
-    wrist_cam = torch.stack(
-        [
-            obs["observation.images.wrist_cam"]
-            for obs in obs_history
-        ],
-        dim=0,
-    ).unsqueeze(0)
-
-    # ---------------------------------------------------------
-    # Construct LeRobot batch
-    # ---------------------------------------------------------
-
-    batch = {
-        "observation.state": state.to(device),
-        "observation.images.table_cam": table_cam.to(device),
-        "observation.images.wrist_cam": wrist_cam.to(device),
-    }
-
-    # ---------------------------------------------------------
-    # Native LeRobot preprocessing
-    # ---------------------------------------------------------
-
-    batch = policy._prepare_batch(batch)
-
-    # ---------------------------------------------------------
-    # Flow-matching inference
-    # ---------------------------------------------------------
-
-    with torch.no_grad():
-        policy_actions = policy._generate_actions(batch)
+    # Server sends "action" as a plain nested list, not a torch.Tensor - see
+    # multitask_dit_server.py's comment on why (avoids the cross-process
+    # multiprocessing shared-memory reducer/authkey mismatch).
+    policy_actions = torch.tensor(response["action"])
 
     print(
-        "[MultiTaskDiT] generated action chunk:",
+        "[FM client] generated action chunk:",
         tuple(policy_actions.shape),
     )
+    print(policy_actions)
 
-    # Expected:
-    #
-    # [1, 24, 7]
+    if "state_ood_loss" in response:
+        print(f"[state OOD] MultiTaskDiT loss for model's own action: {response['state_ood_loss']:.4f}")
+    elif "state_ood_loss_error" in response:
+        print(f"[state OOD] MultiTaskDiT loss errored server-side: {response['state_ood_loss_error']}")
 
-    # ---------------------------------------------------------
-    # LOSSES
-    # ---------------------------------------------------------
-    ###############
-    # State OOD: score the model's own action against its own state (as opposed to the
-    # teleop user_action scored in the not_blend=False branch below), mirroring
-    # run_gloves_policy's state-OOD call.
-    state_ood_loss = multitask_dit_loss(
-        policy, obs_history, policy_actions, num_samples=args_cli.num_samples
-    )
-    print(f"[state OOD] MultiTaskDiT loss for model's own action: {state_ood_loss.item():.4f}")
+    if "state_ood_density" in response:
+        print(f"[state OOD] MultiTaskDiT density for model's own action: {response['state_ood_density']:.4f}")
+    elif "state_ood_density_error" in response:
+        print(f"[state OOD] MultiTaskDiT density errored server-side: {response['state_ood_density_error']}")
 
     # ---------------------------------------------------------
     # Human action
@@ -316,22 +274,14 @@ def run_multitask_ditpolicy(
 
         user_action = teleop_interface.advance()
 
-        action_ood_loss = multitask_dit_loss(
-            policy, obs_history, user_action, num_samples=args_cli.num_samples
-        )
-        print(f"[ACTION] MultiTaskDiT loss for current human action: {action_ood_loss.item():.4f}")
-
-
-    # ---------------------------------------------------------
-    # DENSITIES
-    # ---------------------------------------------------------
-    state_ood_density = multitask_dit_density(policy, obs_history, policy_actions)
-    print(f"[state OOD] MultiTaskDiT density for model's own action: {state_ood_density.item():.4f}")
+        # TODO: scoring the live human action's OOD loss/density against the
+        # server-owned model isn't wired up yet - would need a dedicated server "cmd"
+        # (e.g. "score_action") since the model/preprocessor only live in that process.
 
     return policy_actions, user_action
 
 
-def make_lerobot_obs(obs_dict):
+def make_lerobot_obs(obs_dict, task_instruction):
     """
     Convert the current Isaac Lab observation into the exact
     observation format used by the LeRobot MultiTaskDiT dataset.
@@ -340,6 +290,12 @@ def make_lerobot_obs(obs_dict):
         obs_dict["joint_pos"]   -> [9]
         obs_dict["table_cam"]   -> [3, H, W]
         obs_dict["wrist_cam"]   -> [3, H, W]
+
+    Args:
+        obs_dict: Isaac Lab's observation dict for this step.
+        task_instruction: Language task label the checkpoint was trained on (e.g. "stack
+            cubes" - see the training dataset's meta/tasks.parquet). MultiTaskDiT's LeRobot
+            preprocessor requires this "task" key to tokenize task-conditioning.
     """
 
     obs = obs_dict["policy"] if "policy" in obs_dict else obs_dict
@@ -359,10 +315,28 @@ def make_lerobot_obs(obs_dict):
     if wrist_cam.ndim == 4 and wrist_cam.shape[0] == 1:
         wrist_cam = wrist_cam.squeeze(0)
 
+    # Isaac Lab's Camera sensor returns "rgb" as (H, W, 3) uint8 (see
+    # isaaclab.sensors.camera.Camera._process_annotator_output), but the LeRobot dataset
+    # this checkpoint was trained on stores images as (3, H, W) float32 in [0, 1] - sending
+    # the raw uint8 tensor through as-is both scores the model on the wrong pixel format and
+    # (via NormalizerProcessorStep's dtype-matching in normalize_processor.py) corrupts the
+    # float normalization stats by re-casting them to uint8, which is what raised "value
+    # cannot be converted to type uint8 without overflow" server-side.
+    def _to_chw_float(img):
+        if img.dtype == torch.uint8:
+            img = img.float() / 255.0
+        if img.shape[-1] == 3 and img.shape[0] != 3:
+            img = img.permute(2, 0, 1)
+        return img.contiguous()
+
+    table_cam = _to_chw_float(table_cam)
+    wrist_cam = _to_chw_float(wrist_cam)
+
     return {
         "observation.state": state,
         "observation.images.table_cam": table_cam,
         "observation.images.wrist_cam": wrist_cam,
+        "task": task_instruction,
     }
 
 
@@ -405,11 +379,16 @@ def main():
     # Acquire device
     device = torch.device(args_cli.device)
 
-    # Wire up an input device
-    teleop_interface = Se3SpaceMouse(Se3SpaceMouseCfg(sim_device=device))
-    print(teleop_interface)
-
     not_blend = True if not args_cli.blend else False
+
+    # Wire up an input device - only needed for action blending (--blend), which reads the
+    # live human action via teleop_interface.advance(). Skipped when not_blend=True (the
+    # default) so this script runs without a physically-connected SpaceMouse, e.g. over SSH
+    # where the device is on the client side, not this server.
+    teleop_interface = None
+    if not not_blend:
+        teleop_interface = Se3SpaceMouse(Se3SpaceMouseCfg(sim_device=device))
+        print(teleop_interface)
 
     # Run policy on live actions input from Isaac Lab
     results = []
@@ -417,37 +396,38 @@ def main():
         print(f"[INFO] Starting trial {trial}")
 
         if args_cli.fm_backbone == "gloves":
-            policy = DiTPolicy.from_pretrained(args_cli.fm_checkpoint)
-            policy.to(device)
-            policy.eval()
-
-            # Build an initial n_obs_steps-long obs_history from the first observation,
-            # mirroring run_dp_policy's own history init (repeat the first obs to fill the
-            # window). TODO: once run_gloves_policy grows a real rollout loop (see its
-            # docstring), obs_history should instead be threaded/updated step-to-step there.
-            obs_dict, _ = env.reset()
-            obs = copy.deepcopy(obs_dict["policy"])
-            obs = {k: torch.squeeze(obs[k]) for k in DEFAULT_STATE_KEYS}
-            obs_history = deque([obs] * policy.config.n_obs_steps, maxlen=policy.config.n_obs_steps)
-
-            terminated, traj = run_gloves_policy(policy, obs_history, device, teleop_interface, not_blend)
+            # gloves_server.py (mirroring multitask_dit_server.py's client/server split)
+            # doesn't exist yet - DiTPolicy can't be imported here (yuna_env has no
+            # lerobot_policy_gloves installed), so this backbone isn't runnable yet.
+            raise NotImplementedError(
+                "gloves backbone requires gloves_server.py (not yet written) - see "
+                "multitask_dit's client/server split (multitask_dit_server.py + "
+                "run_multitask_ditpolicy) for the pattern to follow."
+            )
 
         elif args_cli.fm_backbone == "multitask_dit":
-            policy = MultiTaskDiTPolicy.from_pretrained(args_cli.fm_checkpoint)
-            policy.to(device)
-            policy.eval()
+            conn = Client(
+                (args_cli.mdit_server_host, args_cli.mdit_server_port),
+                authkey=args_cli.mdit_server_authkey.encode(),
+            )
+            conn.send({"cmd": "reset"})
+            reset_response = conn.recv()
+            if not reset_response.get("ok", False):
+                raise RuntimeError(f"multitask_dit_server reset failed: {reset_response.get('error')}")
 
             obs_dict, _ = env.reset()
-            obs = make_lerobot_obs(obs_dict)
-            obs_history = deque([obs] * policy.config.n_obs_steps, maxlen=policy.config.n_obs_steps)
+            obs = make_lerobot_obs(obs_dict, args_cli.task_instruction)
 
             policy_actions, user_action = run_multitask_ditpolicy(
-                policy=policy,
-                obs_history=obs_history,
-                device=device,
+                conn=conn,
+                obs=obs,
                 teleop_interface=teleop_interface,
                 not_blend=not_blend,
             )
+
+            conn.send({"cmd": "close"})
+            conn.recv()
+            conn.close()
             # TODO: env.step through policy_actions/blend with user_action, mirroring
             # run_gloves_policy's not_blend=True branch - not wired up yet.
             terminated = False
