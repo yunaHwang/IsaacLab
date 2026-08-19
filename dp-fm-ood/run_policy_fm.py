@@ -106,7 +106,7 @@ parser.add_argument(
 )
 
 parser.add_argument("--horizon", type=int, default=500, help="Step horizon of each rollout.")
-parser.add_argument("--num_rollouts", type=int, default=10, help="Number of rollouts to run.")
+parser.add_argument("--num_rollouts", type=int, default=1, help="Number of rollouts to run.")  # default=10
 parser.add_argument("--seed", type=int, default=42, help="Random seed.")
 
 # append AppLauncher cli args
@@ -269,85 +269,106 @@ def run_gloves_policy(fm_policy, obs_history, device, teleop_interface, not_blen
 
 def run_multitask_ditpolicy(
     conn,
-    obs,
+    env,
+    success_term,
+    horizon,
+    device,
+    task_instruction,
     teleop_interface=None,
-    not_blend=True,
 ):
     """
-    Run the trained LeRobot MultiTaskDiTPolicy via multitask_dit_server.py.
+    Run a full rollout (up to `horizon` steps) of the trained LeRobot MultiTaskDiTPolicy via
+    multitask_dit_server.py, mirroring run_dp_policy's per-step loop/success/termination
+    structure (run_policy_dp.py) so both backbones share the same rollout semantics.
 
     The server owns the model, the LeRobot preprocessor/postprocessor, and the
     n_obs_steps window (see multitask_dit_server.py's module docstring -
-    `select_action` takes one raw timestep per call and pads/queues internally). This
-    function is therefore just an IPC round-trip for a single timestep's observation,
-    not a batch of history - `conn` must already have sent {"cmd": "reset"} once at the
-    start of the episode (see main()).
+    `select_action` takes one raw timestep per call and pads/queues internally, and
+    returns ONE action per call, not a pre-chunked horizon). So each loop iteration here
+    is exactly one obs -> server round trip -> one env.step() - no chunk-splitting needed.
+
+    Every step always executes the policy's own action directly (no blending math is
+    implemented yet - see run_dp_policy/run_gloves_policy's identical gap). When
+    `teleop_interface` is given (--blend), the live SpaceMouse action is also read and
+    printed every step alongside it, purely for visibility/logging - unrestricted, not
+    capped to one read like the earlier single-step scaffold, and not blocking the rollout.
 
     Args:
         conn: An open multiprocessing.connection.Client connection to
             multitask_dit_server.py.
-        obs: A single timestep's observation dict, in make_lerobot_obs's format
-            (raw, un-batched - the server's preprocessor adds the batch dim).
+        env: The environment to roll out in.
+        success_term: The extracted success-termination term (env_cfg.terminations.success),
+            called each step to check whether the rollout succeeded.
+        horizon: The step horizon of this rollout (env_cfg.terminations.time_out is
+            disabled in main(), so this manual Python loop is the only real step cap).
+        device: The device to run the policy/step actions on.
+        task_instruction: Language task label passed to make_lerobot_obs (see
+            --task_instruction).
         teleop_interface: A device (e.g. Se3SpaceMouse) to read the live human action
-            from. Required when not_blend=False.
-        not_blend: If True, only the policy's own action chunk is returned/scored. If
-            False, the live human action is also read (its OOD scoring against the
-            server-owned model isn't wired up yet - see TODO below).
+            from, each step, purely for logging. Optional.
 
     Returns:
-        policy_actions: The action chunk returned by the server (already
-            unnormalized/postprocessed).
-        user_action: The live teleop action, or None if not_blend=True.
+        terminated: True if success_term fired (success), False otherwise (env
+            termination/truncation, or ran out of horizon).
+        traj: The trajectory of the rollout.
     """
 
-    conn.send({"cmd": "step", "obs": obs})
-    response = conn.recv()
+    conn.send({"cmd": "reset"})
+    reset_response = conn.recv()
+    if not reset_response.get("ok", False):
+        raise RuntimeError(f"multitask_dit_server reset failed: {reset_response.get('error')}")
 
-    if not response.get("ok", False):
-        raise RuntimeError(f"multitask_dit_server error: {response.get('error')}")
+    obs_dict, _ = env.reset()
+    if teleop_interface is not None:
+        teleop_interface.reset()
 
-    # Server sends "action" as a plain nested list, not a torch.Tensor - see
-    # multitask_dit_server.py's comment on why (avoids the cross-process
-    # multiprocessing shared-memory reducer/authkey mismatch).
-    policy_actions = torch.tensor(response["action"])
+    traj = dict(policy_actions=[], blended_actions=[], obs=[], next_obs=[])
 
-    print(
-        "[FM client] generated action chunk:",
-        tuple(policy_actions.shape),
-    )
-    print(policy_actions)
+    for i in range(horizon):
+        obs = make_lerobot_obs(obs_dict, task_instruction)
+        traj["obs"].append(obs)
 
-    # if "state_ood_loss" in response:
-    #     print(f"[state OOD] MultiTaskDiT loss for model's own action: {response['state_ood_loss']:.4f}")
-    # elif "state_ood_loss_error" in response:
-    #     print(f"[state OOD] MultiTaskDiT loss errored server-side: {response['state_ood_loss_error']}")
+        conn.send({"cmd": "step", "obs": obs})
+        response = conn.recv()
+        if not response.get("ok", False):
+            raise RuntimeError(f"multitask_dit_server error: {response.get('error')}")
 
-    # if "state_ood_density" in response:
-    #     print(f"[state OOD] MultiTaskDiT density for model's own action: {response['state_ood_density']:.4f}")
-    # elif "state_ood_density_error" in response:
-    #     print(f"[state OOD] MultiTaskDiT density errored server-side: {response['state_ood_density_error']}")
+        # Plain nested list, not a torch.Tensor - see multitask_dit_server.py's comment on
+        # why (avoids the cross-process multiprocessing shared-memory reducer/authkey
+        # mismatch).
+        policy_actions = torch.tensor(response["action"], device=device)
 
-    # ---------------------------------------------------------
-    # Human action
-    # ---------------------------------------------------------
+        if i == 0:
+            print("[FM client] generated action chunk:", tuple(policy_actions.shape))
 
-    user_action = None
+        # if "state_ood_loss" in response:
+        #     print(f"[state OOD] MultiTaskDiT loss for model's own action: {response['state_ood_loss']:.4f}")
+        # elif "state_ood_loss_error" in response:
+        #     print(f"[state OOD] MultiTaskDiT loss errored server-side: {response['state_ood_loss_error']}")
 
-    if not not_blend:
+        # if "state_ood_density" in response:
+        #     print(f"[state OOD] MultiTaskDiT density for model's own action: {response['state_ood_density']:.4f}")
+        # elif "state_ood_density_error" in response:
+        #     print(f"[state OOD] MultiTaskDiT density errored server-side: {response['state_ood_density_error']}")
 
-        if teleop_interface is None:
-            raise RuntimeError(
-                "not_blend=False requires teleop_interface."
-            )
+        # Purely for visibility/logging - not blocking, not capped, and not blended into
+        # the executed action (no blend rule is implemented yet - see TODO in
+        # run_dp_policy/run_gloves_policy's identical not_blend=False gap).
+        if teleop_interface is not None:
+            user_action = teleop_interface.advance()
+            print(f"[SpaceMouse] raw 7-DoF action: {user_action.tolist()}")
 
-        user_action = teleop_interface.advance()
-        print(f"[SpaceMouse] raw 7-DoF action: {user_action.tolist()}")
+        obs_dict, _, terminated, truncated, _ = env.step(policy_actions)
 
-        # TODO: scoring the live human action's OOD loss/density against the
-        # server-owned model isn't wired up yet - would need a dedicated server "cmd"
-        # (e.g. "score_action") since the model/preprocessor only live in that process.
+        traj["policy_actions"].append(policy_actions.tolist())
+        traj["next_obs"].append(obs_dict["policy"])
 
-    return policy_actions, user_action
+        if bool(success_term.func(env, **success_term.params)[0]):
+            return True, traj
+        elif terminated or truncated:
+            return False, traj
+
+    return False, traj
 
 
 def make_lerobot_obs(obs_dict, task_instruction):
@@ -478,54 +499,47 @@ def main():
             )
         print(teleop_interface)
 
+    if args_cli.fm_backbone == "gloves":
+        # gloves_server.py (mirroring multitask_dit_server.py's client/server split)
+        # doesn't exist yet - DiTPolicy can't be imported here (yuna_env has no
+        # lerobot_policy_gloves installed), so this backbone isn't runnable yet.
+        raise NotImplementedError(
+            "gloves backbone requires gloves_server.py (not yet written) - see "
+            "multitask_dit's client/server split (multitask_dit_server.py + "
+            "run_multitask_ditpolicy) for the pattern to follow."
+        )
+    elif args_cli.fm_backbone != "multitask_dit":
+        raise ValueError(f"Unknown --fm_backbone {args_cli.fm_backbone!r}")
+
+    # One persistent connection, reused for every trial (not reopened per trial) - each
+    # trial's own {"cmd": "reset"} (inside run_multitask_ditpolicy) resets the server-side
+    # policy/obs_history for that episode.
+    conn = Client(
+        (args_cli.mdit_server_host, args_cli.mdit_server_port),
+        authkey=args_cli.mdit_server_authkey.encode(),
+    )
+
     # Run policy on live actions input from Isaac Lab
     results = []
     for trial in range(args_cli.num_rollouts):
         print(f"[INFO] Starting trial {trial}")
 
-        if args_cli.fm_backbone == "gloves":
-            # gloves_server.py (mirroring multitask_dit_server.py's client/server split)
-            # doesn't exist yet - DiTPolicy can't be imported here (yuna_env has no
-            # lerobot_policy_gloves installed), so this backbone isn't runnable yet.
-            raise NotImplementedError(
-                "gloves backbone requires gloves_server.py (not yet written) - see "
-                "multitask_dit's client/server split (multitask_dit_server.py + "
-                "run_multitask_ditpolicy) for the pattern to follow."
-            )
-
-        elif args_cli.fm_backbone == "multitask_dit":
-            conn = Client(
-                (args_cli.mdit_server_host, args_cli.mdit_server_port),
-                authkey=args_cli.mdit_server_authkey.encode(),
-            )
-            conn.send({"cmd": "reset"})
-            reset_response = conn.recv()
-            if not reset_response.get("ok", False):
-                raise RuntimeError(f"multitask_dit_server reset failed: {reset_response.get('error')}")
-
-            obs_dict, _ = env.reset()
-            obs = make_lerobot_obs(obs_dict, args_cli.task_instruction)
-
-            policy_actions, user_action = run_multitask_ditpolicy(
-                conn=conn,
-                obs=obs,
-                teleop_interface=teleop_interface,
-                not_blend=not_blend,
-            )
-
-            conn.send({"cmd": "close"})
-            conn.recv()
-            conn.close()
-            # TODO: env.step through policy_actions/blend with user_action, mirroring
-            # run_gloves_policy's not_blend=True branch - not wired up yet.
-            terminated = False
-            traj = dict(policy_actions=[policy_actions.tolist()], blended_actions=[], obs=[], next_obs=[])
-
-        else:
-            raise ValueError(f"Unknown --fm_backbone {args_cli.fm_backbone!r}")
+        terminated, traj = run_multitask_ditpolicy(
+            conn=conn,
+            env=env,
+            success_term=success_term,
+            horizon=args_cli.horizon,
+            device=device,
+            task_instruction=args_cli.task_instruction,
+            teleop_interface=teleop_interface,
+        )
 
         results.append(terminated)
         print(f"[INFO] Trial {trial}: {terminated}\n")
+
+    conn.send({"cmd": "close"})
+    conn.recv()
+    conn.close()
 
     print(f"\nSuccessful trials: {results.count(True)}, out of {len(results)} trials")
     print(f"Success rate: {results.count(True) / len(results)}")
