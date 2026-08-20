@@ -74,6 +74,17 @@ def build_multitask_dit_context(
             Expected image shapes before _prepare_batch:
                 [B, n_obs_steps, 3, H, W]
 
+            If this checkpoint's config sets text_encoder_name (true for any
+            MultiTaskDiT checkpoint - it's always set), the ObservationEncoder
+            also unconditionally expects:
+                "observation.language.tokens"           [B, seq_len]
+                "observation.language.attention_mask"    [B, seq_len]
+            since conditioning_dim is computed including text_dim regardless
+            of whether the task string actually varies across the dataset.
+            Without these two keys, encode() silently skips the text branch
+            and the conditioning vector comes out text_dim short, which then
+            size-mismatches downstream in the DiT's fixed-size layers.
+
     Returns:
         Conditioning tensor produced by the policy's own
         ObservationEncoder.
@@ -176,7 +187,8 @@ def compute_density_score(
     action: torch.Tensor,
     *,
     tile_single_action: bool = True,
-) -> torch.Tensor:
+    return_z_hat: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Compute the density non-conformity score for an action under the
     conditioning observation batch.
@@ -194,6 +206,10 @@ def compute_density_score(
                 observation.state              [B, 2, 9]
                 observation.images.wrist_cam   [B, 2, 3, H, W]
                 observation.images.table_cam   [B, 2, 3, H, W]
+                observation.language.tokens            [B, seq_len]
+                observation.language.attention_mask    [B, seq_len]
+            (see build_multitask_dit_context's docstring for why the language
+            keys are required, not optional, for this checkpoint)
 
         action:
             Action to score. Accepted shapes:
@@ -213,8 +229,21 @@ def compute_density_score(
             policy horizon. This matches the convention used by the old
             GLOVES density implementation.
 
+        return_z_hat:
+            If True, also return ẑ(x) = x - v_theta(x, t=1, context) itself
+            (the recovered latent, [B, horizon, action_dim]) alongside the
+            score. ẑ is NOT a density value - it's the one-step
+            backward-Euler estimate of F_theta^-1(x); the score s(x) =
+            ||ẑ||_2^2 is only proportional to part of -log P_X(x) (the
+            Jacobian log-det correction term is dropped, per the paper).
+            Useful for sanity-checking: under the flow's own training prior
+            (noise = torch.randn_like(action) - see FlowMatchingObjective.
+            compute_loss), a genuinely in-distribution x should have ẑ
+            elements distributed ~N(0, 1) each.
+
     Returns:
-        Tensor [B].
+        Tensor [B] (the non-conformity score s(x)), or (Tensor [B], Tensor
+        [B, horizon, action_dim]) if return_z_hat=True.
     """
     device = next(policy.parameters()).device
     dtype = next(policy.parameters()).dtype
@@ -296,11 +325,16 @@ def compute_density_score(
                 f"action batch size ({action.shape[0]})."
             )
 
-    return nonconformity_score(
-        policy=policy,
-        action_chunk=action,
-        context=context,
-    )
+    if not return_z_hat:
+        return nonconformity_score(
+            policy=policy,
+            action_chunk=action,
+            context=context,
+        )
+
+    z_hat = compute_z_hat(policy=policy, action_chunk=action, context=context)
+    score = z_hat.flatten(start_dim=1).pow(2).sum(dim=1)
+    return score, z_hat
 
 
 @torch.no_grad()

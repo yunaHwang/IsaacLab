@@ -141,9 +141,11 @@ def multitask_dit_loss(policy, obs_history, action, num_samples=512):
 
     Args:
         policy: trained, frozen MultiTaskDiTPolicy.
-        obs_history: iterable of `n_obs_steps` obs dicts, in the format
-            run_multitask_ditpolicy/make_lerobot_obs produce (observation.state,
-            observation.images.table_cam, observation.images.wrist_cam).
+        obs_history: iterable of `n_obs_steps` obs dicts, already normalized/preprocessed
+            the way multitask_dit_server.py's step handler builds them - observation.state,
+            observation.images.table_cam, observation.images.wrist_cam (per-timestep,
+            batch dim stripped) plus observation.language.tokens/attention_mask (one
+            tokenized task string per call, constant across the window, batch dim intact).
         action: [Da], [T, Da], or [B, T, Da] action to score.
         num_samples: Nb, how many independent (noise, timestep) draws to average the loss
             over.
@@ -152,7 +154,7 @@ def multitask_dit_loss(policy, obs_history, action, num_samples=512):
         scalar tensor: mean loss over num_samples draws (whichever objective the policy was
         configured with).
     """
-    from lerobot.utils.constants import ACTION
+    from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 
     Nb = num_samples
     device = next(policy.parameters()).device
@@ -167,6 +169,10 @@ def multitask_dit_loss(policy, obs_history, action, num_samples=512):
     wrist_cam = torch.stack(
         [o["observation.images.wrist_cam"] for o in obs_history], dim=0
     ).unsqueeze(0)  # [1, To, 3, H, W]
+    # Task/language conditioning is constant across the window, so one copy from the
+    # latest step covers the whole obs_history - not stacked per-timestep like state/images.
+    language_tokens = obs_history[-1][OBS_LANGUAGE_TOKENS]  # [1, seq_len]
+    language_attention_mask = obs_history[-1][OBS_LANGUAGE_ATTENTION_MASK]  # [1, seq_len]
 
     action = action.to(device=device, dtype=torch.float32)
     if action.ndim == 1:
@@ -180,9 +186,16 @@ def multitask_dit_loss(policy, obs_history, action, num_samples=512):
         "observation.state": _expand_to_batch(state, Nb).to(device),
         "observation.images.table_cam": _expand_to_batch(table_cam, Nb).to(device),
         "observation.images.wrist_cam": _expand_to_batch(wrist_cam, Nb).to(device),
+        OBS_LANGUAGE_TOKENS: _expand_to_batch(language_tokens, Nb).to(device),
+        OBS_LANGUAGE_ATTENTION_MASK: _expand_to_batch(language_attention_mask, Nb).to(device),
         ACTION: _expand_to_batch(action, Nb).to(device),
     }
-    loss, _ = policy(batch) # https://github.com/huggingface/lerobot/blob/9e14584904d14eb79dc960b27bb40220f85bb993/src/lerobot/policies/multi_task_dit/modeling_multi_task_dit.py
+    # This is a scoring-only forward pass (.item()'d by the caller, never backprop'd) - without
+    # no_grad, autograd retains the full activation graph through the DiT + both CLIP vision
+    # encoders + CLIP text encoder for all Nb samples, which is enough to OOM a 32GB GPU within
+    # a couple of steps (confirmed via smoke test).
+    with torch.no_grad():
+        loss, _ = policy(batch) # https://github.com/huggingface/lerobot/blob/9e14584904d14eb79dc960b27bb40220f85bb993/src/lerobot/policies/multi_task_dit/modeling_multi_task_dit.py
     return loss
 
 #####################################
@@ -212,7 +225,7 @@ def gloves_density(dit_flow, state, action):
 
 
 ## -- MultiTaskDiT --
-def multitask_dit_density(policy, obs_history, action, tile_single_action=False):
+def multitask_dit_density(policy, obs_history, action, tile_single_action=False, return_z_hat=False):
     """MultiTaskDiTPolicy analog of gloves_density - a thin wrapper around
     get_density_multitaskdit.compute_density_score (ood_signal_baseline_papers/
     density/get_density_multitaskdit.py), which already implements the same
@@ -223,19 +236,25 @@ def multitask_dit_density(policy, obs_history, action, tile_single_action=False)
     Args:
         policy: trained, frozen MultiTaskDiTPolicy, configured with a FlowMatchingObjective
             (compute_density_score raises otherwise, via policy.config.is_flow_matching).
-        obs_history: iterable of `n_obs_steps` obs dicts, in the format
-            run_multitask_ditpolicy/make_lerobot_obs produce (observation.state,
-            observation.images.table_cam, observation.images.wrist_cam).
+        obs_history: iterable of `n_obs_steps` obs dicts, already normalized/preprocessed
+            the way multitask_dit_server.py's step handler builds them - observation.state,
+            observation.images.table_cam, observation.images.wrist_cam (per-timestep,
+            batch dim stripped) plus observation.language.tokens/attention_mask (one
+            tokenized task string per call, constant across the window, batch dim intact).
         action: [Da], [B, Da], or [B, T, Da] action to score.
         tile_single_action: if True, a [Da]/[B, Da] action is tiled across the full
             policy.config.horizon (see compute_density_score's docstring). If False
             (default), action must already be a full [B, T, Da] chunk (T ==
             policy.config.horizon) - matches gloves_density's convention of scoring the
             model's own already-generated chunk without implicit tiling.
+        return_z_hat: if True, also return ẑ(x) itself (see compute_density_score's
+            docstring for why ẑ is not itself a density value).
 
     Returns:
-        tensor [B]: s(x) for this action.
+        tensor [B]: s(x) for this action, or (tensor [B], tensor [B, horizon, action_dim])
+        if return_z_hat=True.
     """
+    from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
     from ood_signal_baseline_papers.density.get_density_multitaskdit import (
         compute_density_score,
     )
@@ -251,9 +270,13 @@ def multitask_dit_density(policy, obs_history, action, tile_single_action=False)
         "observation.images.wrist_cam": torch.stack(
             [o["observation.images.wrist_cam"] for o in obs_history], dim=0
         ).unsqueeze(0),
+        # Constant across the window - one copy from the latest step, not stacked
+        # per-timestep like state/images (see obs_history's docstring above).
+        OBS_LANGUAGE_TOKENS: obs_history[-1][OBS_LANGUAGE_TOKENS],
+        OBS_LANGUAGE_ATTENTION_MASK: obs_history[-1][OBS_LANGUAGE_ATTENTION_MASK],
     }
     return compute_density_score(
-        policy, batch, action, tile_single_action=tile_single_action
+        policy, batch, action, tile_single_action=tile_single_action, return_z_hat=return_z_hat
     )
 
 #####################################

@@ -326,6 +326,7 @@ def run_multitask_ditpolicy(
 
     for i in range(horizon):
         obs = make_lerobot_obs(obs_dict, task_instruction)
+        print("obs, ", obs)
         traj["obs"].append(obs)
 
         conn.send({"cmd": "step", "obs": obs})
@@ -341,15 +342,15 @@ def run_multitask_ditpolicy(
         if i == 0:
             print("[FM client] generated action chunk:", tuple(policy_actions.shape))
 
-        # if "state_ood_loss" in response:
-        #     print(f"[state OOD] MultiTaskDiT loss for model's own action: {response['state_ood_loss']:.4f}")
-        # elif "state_ood_loss_error" in response:
-        #     print(f"[state OOD] MultiTaskDiT loss errored server-side: {response['state_ood_loss_error']}")
+        if "state_ood_loss" in response:
+            print(f"[state OOD] MultiTaskDiT loss for model's own action: {response['state_ood_loss']:.4f}")
+        elif "state_ood_loss_error" in response:
+            print(f"[state OOD] MultiTaskDiT loss errored server-side: {response['state_ood_loss_error']}")
 
-        # if "state_ood_density" in response:
-        #     print(f"[state OOD] MultiTaskDiT density for model's own action: {response['state_ood_density']:.4f}")
-        # elif "state_ood_density_error" in response:
-        #     print(f"[state OOD] MultiTaskDiT density errored server-side: {response['state_ood_density_error']}")
+        if "state_ood_density" in response:
+            print(f"[state OOD] MultiTaskDiT non-conformity score s(x)=||z_hat||^2 for model's own action: {response['state_ood_density']:.4f}")
+        elif "state_ood_density_error" in response:
+            print(f"[state OOD] MultiTaskDiT non-conformity score errored server-side: {response['state_ood_density_error']}")
 
         # Purely for visibility/logging - not blocking, not capped, and not blended into
         # the executed action (no blend rule is implemented yet - see TODO in

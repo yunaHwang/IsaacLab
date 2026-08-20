@@ -47,13 +47,21 @@ Inference pattern verified against huggingface/lerobot's actual source (not gues
         action = policy.select_action(batch)
         action = postprocessor(action)          # unnormalize -> cpu
 
-KNOWN GAP (flagged, not fixed here): ood_signal.py's multitask_dit_loss/multitask_dit_density
-(called below, per-step) build their own batch by hand rather than going through
-`preprocessor` above, so unlike the action itself, those two numbers are NOT normalized the
-way the model was trained on - and for the image-conditioned case specifically, that's
-likely not just miscalibrated but meaningless (the vision encoder never saw un-normalized
-pixels during training). Treat state_ood_loss/state_ood_density as a rough/relative signal
-until that's addressed - see this file's TODO markers on the two try/except blocks below.
+NORMALIZATION (fixed): ood_signal.py's multitask_dit_loss/multitask_dit_density are scored
+against obs_history/raw_action below, which are the SAME normalized, preprocessed
+representation `batch = preprocessor(obs)` already produces for select_action - not raw
+`obs` and not the postprocessor's unnormalized action. See the step handler below for how
+obs_history/raw_action are built (reusing `batch`, no second preprocessor(obs) call).
+
+TASK/LANGUAGE CONDITIONING (fixed): obs_history also carries OBS_LANGUAGE_TOKENS/
+OBS_LANGUAGE_ATTENTION_MASK, pulled from that same `batch` (this checkpoint's
+ObservationEncoder always expects them - text_encoder_name is set, so conditioning_dim
+includes text_dim unconditionally, see modeling_multi_task_dit.py - without them the
+conditioning vector comes out text_dim short and size-mismatches downstream). This
+checkpoint was trained on a single constant task string ("stack cubes" - see
+lerobot_dataset_0810/ID-visuomotor-based/meta/tasks.parquet), matching run_policy_fm.py's
+--task_instruction default, so whatever obs["task"] the client sends is already the right
+string to tokenize.
 """
 
 import argparse
@@ -64,6 +72,7 @@ import torch
 
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
+from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 
 from ood_signal import multitask_dit_density, multitask_dit_loss
 
@@ -97,6 +106,26 @@ def main():
     policy.to(device)
     policy.eval()
 
+    # select_action() only regenerates a fresh chunk once every n_action_steps calls
+    # (config.json: horizon=32, n_action_steps=24, num_integration_steps=100 Euler steps -
+    # a full generation is expensive), reusing the queued remainder otherwise. Calling
+    # generate_action_chunk() separately every step for OOD scoring would redo that same
+    # 100-step Euler integration on every single step regardless of whether select_action
+    # needed one - ~24x the intended generation cost, which is enough to OOM the GPU over
+    # a long rollout. Monkey-patching conditional_sample instead captures the exact full
+    # [1, horizon, action_dim] chunk select_action() already produces internally, for free -
+    # same cadence, zero extra generation calls, and it's still the real chunk (never
+    # tiled/fabricated) the currently-queued/executing action actually came from.
+    last_chunk = {"value": None}
+    _orig_conditional_sample = policy.objective.conditional_sample
+
+    def _conditional_sample_and_capture(*args, **kwargs):
+        result = _orig_conditional_sample(*args, **kwargs)
+        last_chunk["value"] = result.detach()
+        return result
+
+    policy.objective.conditional_sample = _conditional_sample_and_capture
+
     # Official LeRobot inference pattern - see this file's module docstring. dataset_stats
     # omitted: relies on normalization stats bundled with the checkpoint at pretrained_path
     # (the standard from_pretrained layout). If your checkpoint doesn't bundle stats, pass a
@@ -105,11 +134,13 @@ def main():
         policy.config, pretrained_path=args.checkpoint
     )
 
-    # A second, separate raw-observation window - NOT policy._queues (which select_action
-    # owns internally, and which only ever holds already-preprocessed tensors) - kept
-    # purely so multitask_dit_loss/multitask_dit_density (ood_signal.py) have something to
-    # score against, mirroring the same n_obs_steps history select_action is conditioning
-    # on. See this file's module docstring for the normalization caveat on those two.
+    # A second, separate observation window - NOT policy._queues (which select_action owns
+    # internally) - kept purely so multitask_dit_loss/multitask_dit_density (ood_signal.py)
+    # have something to score against, mirroring the same n_obs_steps history select_action
+    # is conditioning on. Holds the same normalized, preprocessed per-step tensors `batch`
+    # already has (batch dim stripped) - built once per step below, no second
+    # preprocessor(obs) call. See this file's module docstring for the still-open
+    # task/language conditioning gap on those two.
     obs_history = deque(maxlen=policy.config.n_obs_steps)
 
     listener = Listener((args.host, args.port), authkey=args.authkey.encode())
@@ -134,15 +165,45 @@ def main():
 
                     elif cmd == "step":
                         obs = request["obs"]
-                        obs_history.append(obs)
-                        while len(obs_history) < policy.config.n_obs_steps:
-                            obs_history.append(obs)
+                        print(f"[multitask_dit_server] obs: state={obs['observation.state'].tolist()} task={obs['task']!r}")
 
                         with torch.no_grad():
                             batch = preprocessor(obs)
-                            action = policy.select_action(batch)
-                            action = postprocessor(action)
+
+                            # obs_history stores the SAME normalized, per-step tensors
+                            # `batch` holds (batch dim stripped) - reusing `batch` rather
+                            # than re-deriving anything, so this is not a second
+                            # preprocessor(obs) call.
+                            norm_obs_step = {
+                                key: batch[key].squeeze(0)
+                                for key in (
+                                    "observation.state",
+                                    "observation.images.table_cam",
+                                    "observation.images.wrist_cam",
+                                )
+                            }
+                            # Task/language conditioning: one tokenized task string per
+                            # step call, constant across the whole n_obs_steps window (not
+                            # per-timestep like state/images) - kept with its batch dim
+                            # intact since ObservationEncoder.encode() expects [B, seq_len].
+                            norm_obs_step[OBS_LANGUAGE_TOKENS] = batch[OBS_LANGUAGE_TOKENS]
+                            norm_obs_step[OBS_LANGUAGE_ATTENTION_MASK] = batch[OBS_LANGUAGE_ATTENTION_MASK]
+                            obs_history.append(norm_obs_step)
+                            while len(obs_history) < policy.config.n_obs_steps:
+                                obs_history.append(norm_obs_step)
+
+                            # raw_action is select_action's output BEFORE postprocessor
+                            # unnormalizes it - the same normalized space
+                            # multitask_dit_loss/multitask_dit_density need (and the space
+                            # the model's forward/noise_predictor were trained on). `action`
+                            # is the physical-unit version sent back to the client below.
+                            raw_action = policy.select_action(batch)
+                            action = postprocessor(raw_action)
                         action = action.cpu()
+                        print(
+                            f"[multitask_dit_server] action: normalized={raw_action.tolist()} "
+                            f"physical={action.tolist()}"
+                        )
 
                         # Sent as a plain list, not a torch.Tensor: pickling a raw tensor
                         # through this Connection routes through torch's multiprocessing
@@ -154,30 +215,50 @@ def main():
                         # itself sends fine. Plain data avoids the reducer entirely.
                         response = {"ok": True, "action": action.tolist()}
 
-                        # TODO (see module docstring KNOWN GAP): bypasses `preprocessor`'s
-                        # normalization - relative/trend signal only until fixed.
                         try:
                             state_ood_loss = multitask_dit_loss(
-                                policy, obs_history, action, num_samples=args.num_samples
+                                policy, obs_history, raw_action, num_samples=args.num_samples
                             )
                             response["state_ood_loss"] = state_ood_loss.item()
+                            print(f"[multitask_dit_server] state_ood_loss={response['state_ood_loss']:.6f}")
                         except Exception as e:
                             response["state_ood_loss_error"] = str(e)
+                            print(f"[multitask_dit_server] state_ood_loss FAILED: {e}")
 
-                        # TODO (see module docstring KNOWN GAP): same normalization caveat.
                         try:
-                            state_ood_density = multitask_dit_density(
-                                policy, obs_history, action, tile_single_action=True
+                            # Real full flow-generated chunk [1, horizon, action_dim] -
+                            # captured for free via the conditional_sample monkey-patch
+                            # above (no tiling/fabrication, no redundant generation call).
+                            # select_action() always populates this at least once before
+                            # this point is reached (first call after reset(), when its
+                            # action queue is empty), so this is never None here.
+                            real_chunk = last_chunk["value"]
+
+                            state_ood_score, z_hat = multitask_dit_density(
+                                policy, obs_history, real_chunk, tile_single_action=False, return_z_hat=True
                             )
-                            response["state_ood_density"] = state_ood_density.item()
+                            # response key name is unchanged (state_ood_density, matching the
+                            # paper's own "density"-inspired naming/existing IPC contract) -
+                            # only the printed label below is fixed: what this actually is is
+                            # the non-conformity score s(x) = ||z_hat||^2 (paper Eq. 6), not a
+                            # probability density itself.
+                            response["state_ood_density"] = state_ood_score.item()
+                            z_flat = z_hat.flatten(start_dim=1)
+                            d = z_flat.shape[1]  # horizon * action_dim
+                            print(
+                                f"[multitask_dit_server] nonconformity_score s(x)="
+                                f"{response['state_ood_density']:.6f} "
+                                # f"(in-distribution reference: chi-sq({d}) mean={d}, std={(2 * d) ** 0.5:.2f})"
+                            )
+                            print(
+                                f"[multitask_dit_server] z_hat: mean={z_flat.mean().item():.4f} std={z_flat.std().item():.4f} "
+                                f"min={z_flat.min().item():.4f} max={z_flat.max().item():.4f} "
+                            #     f"(in-distribution reference: mean~0, std~1 per element)"
+                            # )
                         except Exception as e:
                             response["state_ood_density_error"] = str(e)
+                            print(f"[multitask_dit_server] nonconformity_score FAILED: {e}")
 
-                        print(
-                            f"[multitask_dit_server] action={action.tolist()} "
-                            f"loss={response.get('state_ood_loss')} "
-                            f"density={response.get('state_ood_density')}"
-                        )
                         conn.send(response)
 
                         # multitask_dit_loss batches num_samples copies of both camera
