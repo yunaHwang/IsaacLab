@@ -38,101 +38,115 @@ def cubes_stacked(
     cube_1: RigidObject = env.scene[cube_1_cfg.name]
     cube_2: RigidObject = env.scene[cube_2_cfg.name]
 
+    # Color mapping (see config/franka/stack_joint_pos_env_cfg.py RigidObjectCfg usd_path):
+    #   cube_1 = blue_block, cube_2 = red_block, cube_3 = green_block
+    #
+    # There are TWO stacking-order variants below. Exactly ONE must be uncommented at a
+    # time - they both compute `stacked` from scratch and are not meant to run together.
+    # To swap which order this termination checks: comment out the currently-active block
+    # in full (every line, preserving indentation) and uncomment the other block in full
+    # (strip the leading "# " from every line, preserving indentation).
+
+    # --- VARIANT: blue bottom -> green middle -> red top (OOD variant) -----------------
+    # This is the ordering used for the OOD task/dataset (see the corresponding edits in
+    # stack_ik_rel_visuomotor_env_cfg.py and franka_stack_ik_rel_visuomotor_mimic_env_cfg.py).
+    # Left here (inactive) for reference - do not delete, just keep commented out unless
+    # working on the OOD variant again.
+    # if cube_3_cfg is not None:
+    #     cube_3: RigidObject = env.scene[cube_3_cfg.name]
+    #     pos_diff_c31 = cube_1.data.root_pos_w - cube_3.data.root_pos_w
+    #
+    #     xy_dist_c31 = torch.norm(pos_diff_c31[:, :2], dim=1)
+    #     h_dist_c31 = torch.norm(pos_diff_c31[:, 2:], dim=1)
+    #
+    #     stacked = xy_dist_c31 < xy_threshold
+    #
+    #     stacked = torch.logical_and(
+    #         h_dist_c31 - height_diff < height_threshold,
+    #         stacked,
+    #     )
+    #
+    #     # cube_1 must be below cube_3
+    #     stacked = torch.logical_and(
+    #         pos_diff_c31[:, 2] < 0.0,
+    #         stacked,
+    #     )
+    #
+    #     pos_diff_c23 = cube_3.data.root_pos_w - cube_2.data.root_pos_w
+    #
+    #     xy_dist_c23 = torch.norm(pos_diff_c23[:, :2], dim=1)
+    #     h_dist_c23 = torch.norm(pos_diff_c23[:, 2:], dim=1)
+    #
+    #     stacked = torch.logical_and(
+    #         xy_dist_c23 < xy_threshold,
+    #         stacked,
+    #     )
+    #
+    #     stacked = torch.logical_and(
+    #         h_dist_c23 - height_diff < height_threshold,
+    #         stacked,
+    #     )
+    #
+    #     # cube_3 must be below cube_2
+    #     stacked = torch.logical_and(
+    #         pos_diff_c23[:, 2] < 0.0,
+    #         stacked,
+    #     )
+
+    # --- VARIANT: blue bottom -> red middle -> green top (ACTIVE for this ID task) -----
+    # pick red (cube_2), stack on top of blue (cube_1); then pick green (cube_3), stack
+    # on top of red (cube_2).
+    pos_diff_c12 = cube_1.data.root_pos_w - cube_2.data.root_pos_w
+
+    # Compute cube position difference in x-y plane
+    xy_dist_c12 = torch.norm(pos_diff_c12[:, :2], dim=1)
+
+    # Compute cube height difference
+    h_dist_c12 = torch.norm(pos_diff_c12[:, 2:], dim=1)
+
+    # Check cube positions
+    stacked = xy_dist_c12 < xy_threshold
+    stacked = torch.logical_and(h_dist_c12 - height_diff < height_threshold, stacked)
+    # NOTE: yuna - for original ID, use the very bottom, if not (OOD; created), use the one below that
+
+    stacked = torch.logical_and(pos_diff_c12[:, 2] < 0.0, stacked)
+    # stacked = torch.logical_and(pos_diff_c12[:, 2] > 0.0, stacked)
+
     if cube_3_cfg is not None:
+        # print("cube_1, ", cube_1_cfg.name)
+        # print("cube_2, ", cube_2_cfg.name)
+
         cube_3: RigidObject = env.scene[cube_3_cfg.name]
-        pos_diff_c31 = cube_1.data.root_pos_w - cube_3.data.root_pos_w
+        # print("cube_3, ", cube_3_cfg.name)
 
-        xy_dist_c31 = torch.norm(pos_diff_c31[:, :2], dim=1)
-        h_dist_c31 = torch.norm(pos_diff_c31[:, 2:], dim=1)
+        #### SECOND COMPARISON
+        # NOTE: yuna - for original ID, use the very bottom, if not (OOD; created), use the one below that
 
-        stacked = xy_dist_c31 < xy_threshold
+        pos_diff_c23 = cube_2.data.root_pos_w - cube_3.data.root_pos_w
 
-        stacked = torch.logical_and(
-            h_dist_c31 - height_diff < height_threshold,
-            stacked,
-        )
-
-        # cube_1 must be below cube_3
-        stacked = torch.logical_and(
-            pos_diff_c31[:, 2] < 0.0,
-            stacked,
-        )
-
-        pos_diff_c23 = cube_3.data.root_pos_w - cube_2.data.root_pos_w
-
+        # Compute cube position difference in x-y plane
         xy_dist_c23 = torch.norm(pos_diff_c23[:, :2], dim=1)
+
+        # Compute cube height difference
         h_dist_c23 = torch.norm(pos_diff_c23[:, 2:], dim=1)
 
-        stacked = torch.logical_and(
-            xy_dist_c23 < xy_threshold,
-            stacked,
-        )
+        # Check cube positions
+        stacked = torch.logical_and(xy_dist_c23 < xy_threshold, stacked)
+        stacked = torch.logical_and(h_dist_c23 - height_diff < height_threshold, stacked)
+        stacked = torch.logical_and(pos_diff_c23[:, 2] < 0.0, stacked)
 
-        stacked = torch.logical_and(
-            h_dist_c23 - height_diff < height_threshold,
-            stacked,
-        )
+        # pos_diff_c13 = cube_1.data.root_pos_w - cube_3.data.root_pos_w
 
-        # cube_3 must be below cube_2
-        stacked = torch.logical_and(
-            pos_diff_c23[:, 2] < 0.0,
-            stacked,
-        )
+        # # Compute cube position difference in x-y plane
+        # xy_dist_c13 = torch.norm(pos_diff_c13[:, :2], dim=1)
 
-    # #### FIRST COMPARISON
+        # # Compute cube height difference
+        # h_dist_c13 = torch.norm(pos_diff_c13[:, 2:], dim=1)
 
-    # pos_diff_c12 = cube_1.data.root_pos_w - cube_2.data.root_pos_w
-
-    # # Compute cube position difference in x-y plane
-    # xy_dist_c12 = torch.norm(pos_diff_c12[:, :2], dim=1)
-
-    # # Compute cube height difference
-    # h_dist_c12 = torch.norm(pos_diff_c12[:, 2:], dim=1)
-
-    # # Check cube positions
-    # stacked = xy_dist_c12 < xy_threshold
-    # stacked = torch.logical_and(h_dist_c12 - height_diff < height_threshold, stacked)
-    # # NOTE: yuna - for original ID, use the very bottom, if not (OOD; created), use the one below that
-
-    # stacked = torch.logical_and(pos_diff_c12[:, 2] < 0.0, stacked)
-    # # stacked = torch.logical_and(pos_diff_c12[:, 2] > 0.0, stacked)
-
-    # if cube_3_cfg is not None:
-    #     print("cube_1, ", cube_1_cfg.name)
-    #     print("cube_2, ", cube_2_cfg.name)
-
-    #     cube_3: RigidObject = env.scene[cube_3_cfg.name]
-    #     print("cube_3, ", cube_3_cfg.name)
-
-    #     #### SECOND COMPARISON
-    #     # NOTE: yuna - for original ID, use the very bottom, if not (OOD; created), use the one below that
-
-
-    #     pos_diff_c23 = cube_2.data.root_pos_w - cube_3.data.root_pos_w
-
-    #     # Compute cube position difference in x-y plane
-    #     xy_dist_c23 = torch.norm(pos_diff_c23[:, :2], dim=1)
-
-    #     # Compute cube height difference
-    #     h_dist_c23 = torch.norm(pos_diff_c23[:, 2:], dim=1)
-
-    #     # Check cube positions
-    #     stacked = torch.logical_and(xy_dist_c23 < xy_threshold, stacked)
-    #     stacked = torch.logical_and(h_dist_c23 - height_diff < height_threshold, stacked)
-    #     stacked = torch.logical_and(pos_diff_c23[:, 2] < 0.0, stacked)
-
-    #     # pos_diff_c13 = cube_1.data.root_pos_w - cube_3.data.root_pos_w
-
-    #     # # Compute cube position difference in x-y plane
-    #     # xy_dist_c13 = torch.norm(pos_diff_c13[:, :2], dim=1)
-
-    #     # # Compute cube height difference
-    #     # h_dist_c13 = torch.norm(pos_diff_c13[:, 2:], dim=1)
-
-    #     # # Check cube positions
-    #     # stacked = torch.logical_and(xy_dist_c13 < xy_threshold, stacked)
-    #     # stacked = torch.logical_and(h_dist_c13 - height_diff < height_threshold, stacked)
-    #     # stacked = torch.logical_and(pos_diff_c13[:, 2] < 0.0, stacked)
+        # # Check cube positions
+        # stacked = torch.logical_and(xy_dist_c13 < xy_threshold, stacked)
+        # stacked = torch.logical_and(h_dist_c13 - height_diff < height_threshold, stacked)
+        # stacked = torch.logical_and(pos_diff_c13[:, 2] < 0.0, stacked)
 
     # Check gripper positions
     if hasattr(env.scene, "surface_grippers") and len(env.scene.surface_grippers) > 0:

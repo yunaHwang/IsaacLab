@@ -84,7 +84,7 @@ parser.add_argument(
     "multitask_dit_server.py's --authkey.",
 )
 parser.add_argument(
-    "--task_instruction", type=str, default="stack cubes",
+    "--task_instruction", type=str, default="grab red block and stack on top of blue block, then grab green block and stack on top of red block",
     help="Language task label the MultiTaskDiT checkpoint was trained on (see the training "
     "dataset's meta/tasks.parquet) - required for the server's preprocessor to tokenize "
     "task-conditioning.",

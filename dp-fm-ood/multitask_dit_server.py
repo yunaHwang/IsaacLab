@@ -22,7 +22,11 @@ plain socket. Same transport/serialization a raw socket + pickle would use, just
 hand-writing the length-prefix framing. --authkey must match run_policy_fm.py's
 --mdit_server_authkey (multiprocessing.connection.Listener performs an HMAC handshake using
 this shared key - see docs.python.org/3/library/multiprocessing.html#multiprocessing-listeners-and-clients).
-Requests: {"cmd": "reset"} | {"cmd": "step", "obs": {...}} | {"cmd": "close"}.
+Requests: {"cmd": "reset"} | {"cmd": "step", "obs": {...}} |
+{"cmd": "score_action", "obs": {...}, "action": [...]} | {"cmd": "close"}. score_action scores
+a GIVEN action (e.g. a recorded demo's action during replay_dataset_with_scoring.py) against
+obs, instead of generating+scoring the model's own action like "step" does - see that elif
+branch below for detail.
 Responses: {"ok": True, ...} | {"ok": False, "error": "..."}.
 
 Inference pattern verified against huggingface/lerobot's actual source (not guessed):
@@ -254,7 +258,7 @@ def main():
                                 f"[multitask_dit_server] z_hat: mean={z_flat.mean().item():.4f} std={z_flat.std().item():.4f} "
                                 f"min={z_flat.min().item():.4f} max={z_flat.max().item():.4f} "
                             #     f"(in-distribution reference: mean~0, std~1 per element)"
-                            # )
+                            )
                         except Exception as e:
                             response["state_ood_density_error"] = str(e)
                             print(f"[multitask_dit_server] nonconformity_score FAILED: {e}")
@@ -268,6 +272,64 @@ def main():
                         # footprint ratchets up to (and stays at) that peak instead of
                         # settling back down between steps, starving other GPU users (e.g.
                         # the Isaac Lab viewport) even at idle.
+                        torch.cuda.empty_cache()
+
+                    elif cmd == "score_action":
+                        # Scores a GIVEN action (e.g. a recorded demo's ground-truth action
+                        # during replay_dataset_with_scoring.py's visual replay) against the
+                        # current obs, rather than generating+scoring the model's own action
+                        # like "step" does. This is the "action OOD" case from ood_signal.py's
+                        # module docstring - is this externally-supplied action consistent
+                        # with what the model learned - as opposed to "step"'s "state OOD"
+                        # case (is the model's own action consistent with itself).
+                        obs = request["obs"]
+                        action = torch.tensor(request["action"], dtype=torch.float32)
+                        print(f"[multitask_dit_server] score_action obs: state={obs['observation.state'].tolist()} task={obs['task']!r} action={action.tolist()}")
+
+                        with torch.no_grad():
+                            batch = preprocessor(obs)
+                            norm_obs_step = {
+                                key: batch[key].squeeze(0)
+                                for key in (
+                                    "observation.state",
+                                    "observation.images.table_cam",
+                                    "observation.images.wrist_cam",
+                                )
+                            }
+                            norm_obs_step[OBS_LANGUAGE_TOKENS] = batch[OBS_LANGUAGE_TOKENS]
+                            norm_obs_step[OBS_LANGUAGE_ATTENTION_MASK] = batch[OBS_LANGUAGE_ATTENTION_MASK]
+                            obs_history.append(norm_obs_step)
+                            while len(obs_history) < policy.config.n_obs_steps:
+                                obs_history.append(norm_obs_step)
+
+                        response = {"ok": True}
+
+                        try:
+                            # action is a single-step [action_dim] ground-truth action (one
+                            # HDF5 replay step) - multitask_dit_loss tiles it across the
+                            # training horizon internally, same convention as state OOD above.
+                            action_loss = multitask_dit_loss(
+                                policy, obs_history, action, num_samples=args.num_samples
+                            )
+                            response["action_loss"] = action_loss.item()
+                            print(f"[multitask_dit_server] action_loss={response['action_loss']:.6f}")
+                        except Exception as e:
+                            response["action_loss_error"] = str(e)
+                            print(f"[multitask_dit_server] action_loss FAILED: {e}")
+
+                        try:
+                            # tile_single_action=True: this is a single-step action, not a
+                            # pre-chunked horizon like "step"'s real_chunk.
+                            action_density = multitask_dit_density(
+                                policy, obs_history, action, tile_single_action=True
+                            )
+                            response["action_density"] = action_density.item()
+                            print(f"[multitask_dit_server] action_density={response['action_density']:.6f}")
+                        except Exception as e:
+                            response["action_density_error"] = str(e)
+                            print(f"[multitask_dit_server] action_density FAILED: {e}")
+
+                        conn.send(response)
                         torch.cuda.empty_cache()
 
                     elif cmd == "close":

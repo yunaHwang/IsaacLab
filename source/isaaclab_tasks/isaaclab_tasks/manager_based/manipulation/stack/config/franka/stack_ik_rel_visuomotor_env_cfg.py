@@ -135,48 +135,9 @@ class ObservationsCfg:
     class SubtaskCfg(ObsGroup):
         """Observations for subtask group."""
 
-        # grasp_1 = ObsTerm(
-        #     func=mdp.object_grasped,
-        #     params={
-        #         "robot_cfg": SceneEntityCfg("robot"),
-        #         "ee_frame_cfg": SceneEntityCfg("ee_frame"),
-        #         "object_cfg": SceneEntityCfg("cube_2"),
-        #     },
-        # )
-        # stack_1 = ObsTerm(
-        #     func=mdp.object_stacked,
-        #     params={
-        #         "robot_cfg": SceneEntityCfg("robot"),
-        #         "upper_object_cfg": SceneEntityCfg("cube_2"),
-        #         "lower_object_cfg": SceneEntityCfg("cube_1"),
-        #     },
-        # )
-        # grasp_2 = ObsTerm(
-        #     func=mdp.object_grasped,
-        #     params={
-        #         "robot_cfg": SceneEntityCfg("robot"),
-        #         "ee_frame_cfg": SceneEntityCfg("ee_frame"),
-        #         "object_cfg": SceneEntityCfg("cube_3"),
-        #     },
-        # )
-
-        grasp_3= ObsTerm(
-            func=mdp.object_grasped,
-            params={
-                "robot_cfg": SceneEntityCfg("robot"),
-                "ee_frame_cfg": SceneEntityCfg("ee_frame"),
-                "object_cfg": SceneEntityCfg("cube_3") #was cube_2
-            },
-        )
-        stack_3= ObsTerm(
-            func=mdp.object_stacked,
-            params={
-                "robot_cfg": SceneEntityCfg("robot"),
-                "upper_object_cfg": SceneEntityCfg("cube_3"),#was cube_2
-                "lower_object_cfg": SceneEntityCfg("cube_1"),#was cube_1
-            },
-        )
-        grasp_2= ObsTerm(
+        # ID variant (blue -> red -> green): grasp red (cube_2), stack on blue (cube_1);
+        # then grasp green (cube_3), stack on red (cube_2) as the implicit final subtask.
+        grasp_1 = ObsTerm(
             func=mdp.object_grasped,
             params={
                 "robot_cfg": SceneEntityCfg("robot"),
@@ -184,6 +145,50 @@ class ObservationsCfg:
                 "object_cfg": SceneEntityCfg("cube_2"),
             },
         )
+        stack_1 = ObsTerm(
+            func=mdp.object_stacked,
+            params={
+                "robot_cfg": SceneEntityCfg("robot"),
+                "upper_object_cfg": SceneEntityCfg("cube_2"),
+                "lower_object_cfg": SceneEntityCfg("cube_1"),
+            },
+        )
+        grasp_2 = ObsTerm(
+            func=mdp.object_grasped,
+            params={
+                "robot_cfg": SceneEntityCfg("robot"),
+                "ee_frame_cfg": SceneEntityCfg("ee_frame"),
+                "object_cfg": SceneEntityCfg("cube_3"),
+            },
+        )
+
+        # OOD variant (blue -> green -> red): grasp green (cube_3), stack on blue (cube_1);
+        # then grasp red (cube_2) as the implicit final subtask. Left here (inactive) for
+        # reference - do not delete, just keep commented out unless working on OOD again.
+        # grasp_3= ObsTerm(
+        #     func=mdp.object_grasped,
+        #     params={
+        #         "robot_cfg": SceneEntityCfg("robot"),
+        #         "ee_frame_cfg": SceneEntityCfg("ee_frame"),
+        #         "object_cfg": SceneEntityCfg("cube_3") #was cube_2
+        #     },
+        # )
+        # stack_3= ObsTerm(
+        #     func=mdp.object_stacked,
+        #     params={
+        #         "robot_cfg": SceneEntityCfg("robot"),
+        #         "upper_object_cfg": SceneEntityCfg("cube_3"),#was cube_2
+        #         "lower_object_cfg": SceneEntityCfg("cube_1"),#was cube_1
+        #     },
+        # )
+        # grasp_2= ObsTerm(
+        #     func=mdp.object_grasped,
+        #     params={
+        #         "robot_cfg": SceneEntityCfg("robot"),
+        #         "ee_frame_cfg": SceneEntityCfg("ee_frame"),
+        #         "object_cfg": SceneEntityCfg("cube_2"),
+        #     },
+        # )
 
         def __post_init__(self):
             self.enable_corruption = False
