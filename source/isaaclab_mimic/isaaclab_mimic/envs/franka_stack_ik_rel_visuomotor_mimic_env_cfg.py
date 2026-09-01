@@ -31,7 +31,7 @@ class FrankaCubeStackIKRelVisuomotorMimicEnvCfg(FrankaCubeStackVisuomotorEnvCfg,
         self.datagen_config.generation_interpolate_from_last_target_pose = True
         self.datagen_config.generation_relative = True
         self.datagen_config.max_num_failures = 25
-        self.datagen_config.seed = 1
+        self.datagen_config.seed = 2 # NOTE. Yuna: was 1
 
         # The following are the subtask configurations for the stack task.
         # ID variant (blue -> red -> green): grasp red (cube_2), stack on blue (cube_1);

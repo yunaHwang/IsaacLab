@@ -373,7 +373,7 @@ def convert_isaaclab_to_lerobot():
         fps=dataset_cfg.fps,
         robot_type=dataset_cfg.robot_type,
         features=dataset_cfg.features,
-        root='./lerobot_dataset_0825_300_descriptive/ID-visuomotor-based' # NOTE - change here!
+        root='./lerobot_dataset_0828_grad_accum_test/ID-visuomotor-based' # NOTE - change here!
     )
 
     if args_cli.hdf5_files is None:
