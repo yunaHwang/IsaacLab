@@ -91,6 +91,12 @@ parser.add_argument(
     "dataset's meta/tasks.parquet) - required for the server's preprocessor to tokenize "
     "task-conditioning.",
 )
+parser.add_argument(
+    "--state_mode", type=str, choices=["auto", "joint_pos", "eef_pose"], default="auto",
+    help="Which observation.state layout to build: 'joint_pos' (9 dims, pre-0908 checkpoints) "
+    "or 'eef_pose' (8 dims, 0908-onward EE-pose checkpoints). 'auto' (default) takes it from "
+    "the dim the server reports for whichever checkpoint it loaded. See lerobot_obs.py.",
+)
 parser.add_argument("--output_csv", type=str, default=None, help="If set, write one row per (episode, step) with action_loss/action_density to this CSV path.")
 
 # append AppLauncher cli args
@@ -113,6 +119,8 @@ from multiprocessing.connection import Client
 
 import gymnasium as gym
 import torch
+
+from lerobot_obs import make_lerobot_obs, resolve_state_mode
 
 from isaaclab.devices import Se3Keyboard, Se3KeyboardCfg
 from isaaclab.utils.datasets import EpisodeData, HDF5DatasetFileHandler
@@ -137,40 +145,10 @@ def pause_cb():
     is_paused = True
 
 
-def make_lerobot_obs(obs_dict, task_instruction):
-    """Same conversion run_policy_fm.py's make_lerobot_obs does - duplicated here (not
-    imported) since importing run_policy_fm.py would re-run its module-level AppLauncher.
-    See run_policy_fm.py's make_lerobot_obs docstring for the uint8-vs-float/HWC-vs-CHW
-    rationale."""
-    obs = obs_dict["policy"] if "policy" in obs_dict else obs_dict
-
-    state = obs["joint_pos"]
-    table_cam = obs["table_cam"]
-    wrist_cam = obs["wrist_cam"]
-
-    if state.ndim > 1 and state.shape[0] == 1:
-        state = state.squeeze(0)
-    if table_cam.ndim == 4 and table_cam.shape[0] == 1:
-        table_cam = table_cam.squeeze(0)
-    if wrist_cam.ndim == 4 and wrist_cam.shape[0] == 1:
-        wrist_cam = wrist_cam.squeeze(0)
-
-    def _to_chw_float(img):
-        if img.dtype == torch.uint8:
-            img = img.float() / 255.0
-        if img.shape[-1] == 3 and img.shape[0] != 3:
-            img = img.permute(2, 0, 1)
-        return img.contiguous()
-
-    table_cam = _to_chw_float(table_cam)
-    wrist_cam = _to_chw_float(wrist_cam)
-
-    return {
-        "observation.state": state,
-        "observation.images.table_cam": table_cam,
-        "observation.images.wrist_cam": wrist_cam,
-        "task": task_instruction,
-    }
+# make_lerobot_obs lives in lerobot_obs.py, shared with run_policy_fm.py and
+# replay_training_rollouts.py - it used to be copied into all three (importing run_policy_fm.py
+# re-runs its module-level AppLauncher, so the copy was deliberate), which meant the
+# joint_pos -> eef_pose state-layout fix had to land three separate times.
 
 
 def main():
@@ -251,6 +229,11 @@ def main():
     failed_demo_ids = []
     csv_rows = []
 
+    # Provisional until the first {"cmd": "reset"} comes back with the server's authoritative
+    # observation.state dim (see the reset handler in the loop below); resolved here too so
+    # the name is always bound, and so an explicit --state_mode is honoured either way.
+    state_mode, _why = resolve_state_mode(requested=args_cli.state_mode)
+
     with contextlib.suppress(KeyboardInterrupt) and torch.inference_mode():
         while simulation_app.is_running() and not simulation_app.is_exiting():
             env_episode_data_map = {index: EpisodeData() for index in range(num_envs)}
@@ -312,6 +295,14 @@ def main():
                             reset_response = conn.recv()
                             if not reset_response.get("ok", False):
                                 raise RuntimeError(f"multitask_dit_server reset failed: {reset_response.get('error')}")
+                            # Layout of observation.state comes from the SERVER's loaded
+                            # checkpoint (9 = joint_pos, 8 = the 0908-onward EE pose); this
+                            # script has no checkpoint path of its own. See lerobot_obs.py.
+                            state_mode, why = resolve_state_mode(
+                                requested=args_cli.state_mode,
+                                state_dim=reset_response.get("state_dim"),
+                            )
+                            print(f"[INFO] observation.state layout: {state_mode} ({why})")
 
                             env_next_action = env_episode_data_map[env_id].get_next_action()
                             has_next_action = True
@@ -333,7 +324,7 @@ def main():
                 for env_id in range(num_envs):
                     if not has_next_action and episode_ended[env_id]:
                         continue
-                    raw_obs = make_lerobot_obs(obs_dict, args_cli.task_instruction)
+                    raw_obs = make_lerobot_obs(obs_dict, args_cli.task_instruction, state_mode)
                     conn.send({"cmd": "score_action", "obs": raw_obs, "action": actions[env_id].tolist()})
                     score_response = conn.recv()
                     if not score_response.get("ok", False):

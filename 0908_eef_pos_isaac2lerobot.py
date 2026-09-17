@@ -107,6 +107,78 @@ from leisaac.utils.env_utils import get_task_type
 from leisaac.utils.robot_utils import build_feature_from_env
 
 
+def eef_state(eef_pos, eef_quat, gripper_pos):
+    """End-effector state as [pos(3), axis-angle(3), gripper(2)] = 8 dims -- LIBERO's layout.
+
+    WHY THIS REPLACED joint_pos
+        The task is `Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Mimic-v0`: `IK-Rel` means the
+        ACTIONS are relative end-effector deltas (3 translation + 3 rotation + 1 gripper). But
+        leisaac's converter always wrote `joint_pos` as observation.state -- it is built for
+        SO101Leader teleoperation, where the action IS a joint target so joint state and action
+        share a frame. Its own comment admits the assumption. On an IK-Rel Franka that breaks:
+        the policy reads joint space and writes EE space, so it has to learn forward kinematics
+        just to connect its input to its output. The reference model
+        (marvin-oh/multitask_dit_libero_plus) and LIBERO both use EE state with EE actions.
+
+    NO FORWARD KINEMATICS NEEDED. IsaacLab already logs obs/eef_pos and obs/eef_quat every
+    frame. LeRobot's ForwardKinematicsJointsToEE exists for REAL robots that only report joint
+    encoders and must recompute the pose from a URDF; recomputing a measured quantity here would
+    only add a URDF dependency and risk a tool-frame mismatch with IsaacLab's EE definition.
+
+    QUATERNION ORDER IS A SILENT TRAP. IsaacLab is scalar-FIRST (w, x, y, z)
+    (isaaclab/utils/math.py); scipy's Rotation.from_quat wants scalar-LAST (x, y, z, w). Passing
+    eef_quat straight through produces wrong rotations with no error.
+
+    ON AXIS-ANGLE. It is degenerate at 180 deg, where +pi*n and -pi*n are the same rotation, so a
+    tiny wobble flips the encoding across its whole range. This gripper points down (~180 deg from
+    the base frame) for 96.5% of frames, and its yaw also wraps: measured over all 85,411 frames,
+    raw axis-angle spans 2*pi per dim, and even measured relative to "straight down" it reaches
+    3.139 rad against pi=3.142. So the wrapping here is REAL.
+
+    We use axis-angle anyway, on purpose: LIBERO has the same pathology (its state dim 4 spans
+    7.202 > 2*pi, dim 3 has mean 2.972 against pi=3.142) and Pi0.5 still scores 97.5% on it. A
+    6D rotation (first two columns of the rotation matrix, 9-dim state) removes the discontinuity
+    entirely and is the cheap one-variable ablation if this is ever suspected of costing accuracy
+    -- but matching the reference comes first.
+    """
+    import numpy as np
+    from scipy.spatial.transform import Rotation as R
+
+    q_wxyz = np.asarray(eef_quat, dtype=np.float64).reshape(4)
+    q_xyzw = q_wxyz[[1, 2, 3, 0]]                      # IsaacLab -> scipy
+    q_xyzw = q_xyzw / np.linalg.norm(q_xyzw)
+    axis_angle = R.from_quat(q_xyzw).as_rotvec()       # (3,)
+
+    return np.concatenate([
+        np.asarray(eef_pos, dtype=np.float32).reshape(3),
+        axis_angle.astype(np.float32),
+        np.asarray(gripper_pos, dtype=np.float32).reshape(2),
+    ]).astype(np.float32)
+
+
+def patch_state_feature(features, state_dim=8):
+    """Override leisaac's joint-space state feature with the 8-dim EE state.
+
+    No object/cube columns are written: LIBERO's observation.state is purely proprioceptive and
+    the dataset carries no object pose, so this keeps the schema identical to the reference.
+    Cube pose remains available in the source hdf5 (obs/cube_positions, obs/cube_orientations,
+    obs/datagen_info/object_pose/cube_*) if a probe or auxiliary loss ever needs it -- join on
+    episode and frame index rather than re-exporting.
+
+    build_feature_from_env hardcodes observation.state to len(default_feature_joint_names) (9 for
+    this Franka). Writing an 8-dim state against a 9-dim declaration makes LeRobotDataset reject
+    the frame, so the declaration has to be corrected too.
+    """
+    features["observation.state"] = {
+        "dtype": "float32",
+        "shape": (state_dim,),
+        "names": ["x", "y", "z", "rx", "ry", "rz", "gripper_1", "gripper_2"],
+    }
+    return features
+
+
+
+
 def split_episode(episode: EpisodeData, num_frames: int) -> list[EpisodeData]:
     def slice_at_index(data, idx: int):
         """Take the idx-th frame from the nested data structure."""
@@ -309,8 +381,13 @@ def convert_isaaclab_to_lerobot():
         # LeRobot action
         frame["action"] = to_numpy(actions)
 
-        # Robot proprioception
-        frame["observation.state"] = to_numpy(obs["joint_pos"])
+        # Robot proprioception -- END-EFFECTOR pose, matching the LIBERO 8-dim layout
+        # (eef position, axis-angle orientation, gripper qpos). See eef_state() below for why
+        # this replaced joint_pos.
+        frame["observation.state"] = eef_state(
+            to_numpy(obs["eef_pos"]), to_numpy(obs["eef_quat"]), to_numpy(obs["gripper_pos"])
+        )
+
 
         # NOTE: yuna add - image
         frame["observation.images.table_cam"] = (
@@ -381,6 +458,8 @@ def convert_isaaclab_to_lerobot():
     ]
 
     dataset_cfg.features = build_feature_from_env(env, dataset_cfg)
+    # Replace the hardcoded joint-space state with the EE state, and add the diagnostic columns.
+    dataset_cfg.features = patch_state_feature(dataset_cfg.features)
 
     #print("keys", dataset_cfg.features.keys())
 

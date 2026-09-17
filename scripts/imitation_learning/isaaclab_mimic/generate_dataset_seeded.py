@@ -55,6 +55,16 @@ parser.add_argument(
         " batch of demos."
     ),
 )
+parser.add_argument(
+    "--no_env_metadata",
+    action="store_true",
+    default=False,
+    help=(
+        "Don't write the sidecar files next to --output_file: <stem>_env.json (cameras, lights, materials/textures,"
+        " randomization events, seed), <stem>_env_cfg.yaml (full env config) and <stem>_episodes.jsonl (one line"
+        " per dataset episode: cameras, lights, materials at its reset). See env_metadata.py."
+    ),
+)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -92,6 +102,8 @@ from isaaclab_mimic.datagen.generation import env_loop, setup_async_generation, 
 from isaaclab_mimic.datagen.utils import get_env_name_from_dataset, setup_output_paths
 
 import isaaclab_tasks  # noqa: F401
+
+from env_metadata import log_episodes, write_run_metadata  # sibling module in this scripts directory
 
 # import logger
 logger = logging.getLogger(__name__)
@@ -143,6 +155,13 @@ def main():
 
     # Reset before starting
     env.reset()
+
+    # Camera / lighting / material / config sidecars next to the dataset (the hdf5 itself only stores env_name).
+    if not args_cli.no_env_metadata:
+        output_path = args_cli.output_file
+        write_run_metadata(env, output_path, seed=env.cfg.datagen_config.seed, task=env_name)
+        # One line per episode in the hdf5 (and _failed.hdf5): cameras / lights / materials at that episode's reset.
+        log_episodes(env, output_path)
 
     motion_planners = None
     if args_cli.use_skillgen:

@@ -23,7 +23,7 @@ hand-writing the length-prefix framing. --authkey must match run_policy_fm.py's
 --mdit_server_authkey (multiprocessing.connection.Listener performs an HMAC handshake using
 this shared key - see docs.python.org/3/library/multiprocessing.html#multiprocessing-listeners-and-clients).
 Requests: {"cmd": "reset"} | {"cmd": "step", "obs": {...}} |
-{"cmd": "score_action", "obs": {...}, "action": [...]} | {"cmd": "close"}. score_action scores
+{"cmd": "score_action", "obs": {...}, "action": [...], "density": bool} | {"cmd": "close"}. score_action scores
 a GIVEN action (e.g. a recorded demo's action during replay_dataset_with_scoring.py) against
 obs, instead of generating+scoring the model's own action like "step" does - see that elif
 branch below for detail.
@@ -69,6 +69,7 @@ string to tokenize.
 """
 
 import argparse
+import os
 from collections import deque
 from multiprocessing.connection import Listener
 
@@ -78,7 +79,13 @@ from lerobot.policies import make_pre_post_processors
 from lerobot.policies.multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 
+from ood_csv_logger import StateOODCsvLogger
 from ood_signal import multitask_dit_density, multitask_dit_loss
+
+import sys
+from pathlib import Path as _P
+sys.path.insert(0, str(_P(__file__).resolve().parent))
+from patch_tokens import assert_fully_loaded, maybe_install_patch_tokens  # noqa: E402
 
 DEFAULT_AUTHKEY = "mdit-ipc"
 
@@ -91,6 +98,11 @@ def main():
     )
     parser.add_argument("--checkpoint", type=str, required=True, help="Path or hub id of a trained MultiTaskDiTPolicy checkpoint.")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--n_action_steps", type=int, default=None,
+        help="Override how many steps of each predicted chunk are executed before replanning. "
+             "Inference-only (see the note where it is applied); omit to use the checkpoint's "
+             "trained value. Lower = more reactive, more inference calls.")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument(
@@ -103,12 +115,48 @@ def main():
         help="Nb for the diffdagger-style loss computed alongside each action (see "
         "ood_signal.multitask_dit_loss).",
     )
+    parser.add_argument(
+        "--ood_csv", type=str, default=None,
+        help="If set, append one row per step (seed, trial, step, state_ood_loss, raw_action, "
+        "obs_history) to this CSV - see ood_csv_logger.py. Accumulates across runs.",
+    )
     args = parser.parse_args()
 
+    ood_csv_logger = StateOODCsvLogger(args.ood_csv) if args.ood_csv else None
+    if ood_csv_logger is not None:
+        print(f"[multitask_dit_server] logging state OOD rows to {args.ood_csv}")
+
     device = torch.device(args.device)
+    # MUST precede from_pretrained(): it patches the encoder CLASS. Without it a PATCH_TOKENS
+    # checkpoint loads onto the CLS encoder and strict=False silently drops patch_proj, so the
+    # policy runs a path it was never trained for (see patch_tokens.py).
+    note = maybe_install_patch_tokens(args.checkpoint)
+    if note:
+        print(f"[patch] {note}")
     policy = MultiTaskDiTPolicy.from_pretrained(args.checkpoint)
+    assert_fully_loaded(policy, args.checkpoint)
     policy.to(device)
     policy.eval()
+
+    # The checkpoint's config.json records device="cuda" (whatever it was trained on), and
+    # make_pre_post_processors() below builds a DeviceProcessorStep from config.device. Without
+    # this line, `--device cpu` moves the WEIGHTS to cpu while the preprocessor keeps pushing
+    # inputs to cuda, so the batch and the model end up on different devices. Keep the config in
+    # sync with what we actually loaded onto.
+    policy.config.device = args.device
+
+    # n_action_steps is an INFERENCE-time knob, not an architectural one: _generate_actions
+    # always samples a full `horizon`-length chunk and then slices actions[:, start:start +
+    # n_action_steps] (modeling_multi_task_dit.py), and select_action queues exactly that many
+    # before regenerating. So "how long do we commit open-loop" can be swept on an EXISTING
+    # checkpoint without retraining -- 24 steps is 0.8 s at 30 Hz, 8 steps is 0.27 s.
+    # (`horizon` is different: changing it would change the generated sequence length and does
+    # require a retrain.) Training is affected only via drop_n_last_frames, which is already
+    # baked into this checkpoint, so overriding here changes execution only.
+    if args.n_action_steps is not None:
+        print(f"[multitask_dit_server] overriding n_action_steps "
+              f"{policy.config.n_action_steps} -> {args.n_action_steps}")
+        policy.config.n_action_steps = args.n_action_steps
 
     # select_action() only regenerates a fresh chunk once every n_action_steps calls
     # (config.json: horizon=32, n_action_steps=24, num_integration_steps=100 Euler steps -
@@ -134,8 +182,15 @@ def main():
     # omitted: relies on normalization stats bundled with the checkpoint at pretrained_path
     # (the standard from_pretrained layout). If your checkpoint doesn't bundle stats, pass a
     # real dataset's `.meta.stats` here instead.
+    # device_processor override: the SAVED processor config in the checkpoint also records
+    # device="cuda", and make_pre_post_processors() rebuilds the step from that saved config --
+    # setting policy.config.device above is not enough to reach it. Without this override,
+    # `--device cpu` fails outright (the step cannot even be instantiated when CUDA is hidden).
+    # This mirrors what lerobot_train.py does at scripts/lerobot_train.py:389.
     preprocessor, postprocessor = make_pre_post_processors(
-        policy.config, pretrained_path=args.checkpoint
+        policy.config,
+        pretrained_path=args.checkpoint,
+        preprocessor_overrides={"device_processor": {"device": device.type}},
     )
 
     # A second, separate observation window - NOT policy._queues (which select_action owns
@@ -147,8 +202,15 @@ def main():
     # task/language conditioning gap on those two.
     obs_history = deque(maxlen=policy.config.n_obs_steps)
 
+    # The observation.state width this checkpoint was trained on, sent to the client on every
+    # reset so it builds the matching layout (see lerobot_obs.py). Read from the loaded
+    # policy's own config, so it is the model's truth rather than a folder-name guess.
+    state_dim = int(policy.config.input_features["observation.state"].shape[0])
+
     listener = Listener((args.host, args.port), authkey=args.authkey.encode())
     print(f"[multitask_dit_server] listening on {args.host}:{args.port}, checkpoint={args.checkpoint}, device={device}")
+    print(f"[multitask_dit_server] observation.state dim={state_dim} "
+          f"({'eef_pose' if state_dim == 8 else 'joint_pos' if state_dim == 9 else 'unknown layout'})")
 
     try:
         while True:
@@ -165,11 +227,23 @@ def main():
                     if cmd == "reset":
                         policy.reset()
                         obs_history.clear()
-                        conn.send({"ok": True})
+                        if ood_csv_logger is not None:
+                            # seed/trial come from the client (run_policy_fm.py) - the server
+                            # never sees --seed otherwise. Absent from older clients -> blank.
+                            ood_csv_logger.begin_episode(seed=request.get("seed"), trial=request.get("trial"))
+                        # state_dim tells the client which observation.state LAYOUT to build
+                        # (9 = joint_pos, 8 = the 0908-onward EE pose) - see lerobot_obs.py's
+                        # resolve_state_mode. Reporting it here, from the checkpoint's own
+                        # config, is what stops a client from silently sending the other
+                        # layout and getting "The size of tensor a (9) must match the size of
+                        # tensor b (8) at non-singleton dimension 1" out of the normalizer.
+                        # ood_csv lets the client save its live loss plot next to the CSV.
+                        conn.send({"ok": True, "state_dim": state_dim,
+                                   "ood_csv": os.path.abspath(args.ood_csv) if args.ood_csv else None})
 
                     elif cmd == "step":
                         obs = request["obs"]
-                        print(f"[multitask_dit_server] obs: state={obs['observation.state'].tolist()} task={obs['task']!r}")
+                        # print(f"[multitask_dit_server] obs: state={obs['observation.state'].tolist()} task={obs['task']!r}")
 
                         with torch.no_grad():
                             batch = preprocessor(obs)
@@ -229,6 +303,17 @@ def main():
                             response["state_ood_loss_error"] = str(e)
                             print(f"[multitask_dit_server] state_ood_loss FAILED: {e}")
 
+                        if ood_csv_logger is not None:
+                            try:
+                                ood_csv_logger.log_step(
+                                    obs_history,
+                                    raw_action,
+                                    state_ood_loss=response.get("state_ood_loss"),
+                                    state_ood_loss_error=response.get("state_ood_loss_error"),
+                                )
+                            except Exception as e:
+                                print(f"[multitask_dit_server] ood_csv logging FAILED: {e}")
+
                         try:
                             # Real full flow-generated chunk [1, horizon, action_dim] -
                             # captured for free via the conditional_sample monkey-patch
@@ -276,18 +361,28 @@ def main():
 
                     elif cmd == "score_action":
                         # Scores a GIVEN action (e.g. a recorded demo's ground-truth action
-                        # during replay_dataset_with_scoring.py's visual replay) against the
-                        # current obs, rather than generating+scoring the model's own action
-                        # like "step" does. This is the "action OOD" case from ood_signal.py's
-                        # module docstring - is this externally-supplied action consistent
-                        # with what the model learned - as opposed to "step"'s "state OOD"
-                        # case (is the model's own action consistent with itself).
+                        # during replay_dataset_with_scoring.py's visual replay, or the live
+                        # SpaceMouse command from run_policy_fm.py's run_spacemouse_teleop)
+                        # against the current obs, rather than generating+scoring the model's own
+                        # action like "step" does. This is the "action OOD" case from
+                        # ood_signal.py's module docstring - is this externally-supplied action
+                        # consistent with what the model learned - as opposed to "step"'s "state
+                        # OOD" case (is the model's own action consistent with itself).
+                        #
+                        # Request: {"cmd": "score_action", "obs": {...}, "action": [action_dim]
+                        # PHYSICAL action as passed to env.step, "density": bool (default True)}.
                         obs = request["obs"]
-                        action = torch.tensor(request["action"], dtype=torch.float32)
-                        print(f"[multitask_dit_server] score_action obs: state={obs['observation.state'].tolist()} task={obs['task']!r} action={action.tolist()}")
+                        physical_action = torch.as_tensor(request["action"], dtype=torch.float32).reshape(-1)
+                        print(f"[multitask_dit_server] score_action obs: state={obs['observation.state'].tolist()} task={obs['task']!r} action={physical_action.tolist()}")
 
                         with torch.no_grad():
-                            batch = preprocessor(obs)
+                            # The action goes through the SAME preprocessor as the obs, so it is
+                            # MIN_MAX-normalized with the checkpoint's action stats - the space the
+                            # model was trained on and the space "step"'s raw_action lives in.
+                            # (Previously the physical action was scored as-is, i.e. in the wrong
+                            # space.) Obs outputs are identical with or without the action key.
+                            batch = preprocessor({**obs, "action": physical_action})
+                            action = batch["action"].reshape(1, -1)  # normalized [1, action_dim]
                             norm_obs_step = {
                                 key: batch[key].squeeze(0)
                                 for key in (
@@ -302,12 +397,12 @@ def main():
                             while len(obs_history) < policy.config.n_obs_steps:
                                 obs_history.append(norm_obs_step)
 
-                        response = {"ok": True}
+                        response = {"ok": True, "normalized_action": action.cpu().tolist()}
 
                         try:
-                            # action is a single-step [action_dim] ground-truth action (one
-                            # HDF5 replay step) - multitask_dit_loss tiles it across the
-                            # training horizon internally, same convention as state OOD above.
+                            # Single-step [1, action_dim] action - multitask_dit_loss tiles it
+                            # across the training horizon internally, same convention as "step"'s
+                            # state_ood_loss on its [1, action_dim] raw_action.
                             action_loss = multitask_dit_loss(
                                 policy, obs_history, action, num_samples=args.num_samples
                             )
@@ -317,17 +412,34 @@ def main():
                             response["action_loss_error"] = str(e)
                             print(f"[multitask_dit_server] action_loss FAILED: {e}")
 
-                        try:
-                            # tile_single_action=True: this is a single-step action, not a
-                            # pre-chunked horizon like "step"'s real_chunk.
-                            action_density = multitask_dit_density(
-                                policy, obs_history, action, tile_single_action=True
-                            )
-                            response["action_density"] = action_density.item()
-                            print(f"[multitask_dit_server] action_density={response['action_density']:.6f}")
-                        except Exception as e:
-                            response["action_density_error"] = str(e)
-                            print(f"[multitask_dit_server] action_density FAILED: {e}")
+                        if ood_csv_logger is not None:
+                            # Same row layout as "step": the loss goes in the state_ood_loss column
+                            # and raw_action_* is the normalized scored action; the physical action
+                            # is added as physical_action_*. Use a separate --ood_csv from policy
+                            # runs - the extra columns do not fit a policy CSV's header.
+                            try:
+                                ood_csv_logger.log_step(
+                                    obs_history,
+                                    action,
+                                    state_ood_loss=response.get("action_loss"),
+                                    state_ood_loss_error=response.get("action_loss_error"),
+                                    extra={f"physical_action_{d}": f"{v:.8g}" for d, v in enumerate(physical_action.tolist())},
+                                )
+                            except Exception as e:
+                                print(f"[multitask_dit_server] ood_csv logging FAILED: {e}")
+
+                        if request.get("density", True):
+                            try:
+                                # tile_single_action=True: this is a single-step action, not a
+                                # pre-chunked horizon like "step"'s real_chunk.
+                                action_density = multitask_dit_density(
+                                    policy, obs_history, action, tile_single_action=True
+                                )
+                                response["action_density"] = action_density.item()
+                                print(f"[multitask_dit_server] action_density={response['action_density']:.6f}")
+                            except Exception as e:
+                                response["action_density_error"] = str(e)
+                                print(f"[multitask_dit_server] action_density FAILED: {e}")
 
                         conn.send(response)
                         torch.cuda.empty_cache()

@@ -53,6 +53,11 @@ from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TO
 
 from ood_signal import multitask_dit_density, multitask_dit_loss
 
+import sys
+from pathlib import Path as _P
+sys.path.insert(0, str(_P(__file__).resolve().parent))
+from patch_tokens import assert_fully_loaded, maybe_install_patch_tokens  # noqa: E402
+
 
 def build_raw_obs(item):
     return {
@@ -101,7 +106,14 @@ def main():
         raise ValueError("--include_model_action requires --stride 1 (select_action's internal queue assumes consecutive frames).")
 
     device = torch.device(args.device)
+    # MUST precede from_pretrained(): it patches the encoder CLASS. Without it a PATCH_TOKENS
+    # checkpoint loads onto the CLS encoder and strict=False silently drops patch_proj, so the
+    # policy runs a path it was never trained for (see patch_tokens.py).
+    note = maybe_install_patch_tokens(args.checkpoint)
+    if note:
+        print(f"[patch] {note}")
     policy = MultiTaskDiTPolicy.from_pretrained(args.checkpoint)
+    assert_fully_loaded(policy, args.checkpoint)
     policy.to(device)
     policy.eval()
 
