@@ -85,6 +85,19 @@ gym.register(
     disable_env_checker=True,
 )
 
+# added! Yuna - Rel-Visuomotor with the blue block (cube_1) hidden: invisible, non-colliding, kinematic
+gym.register(
+    id="Isaac-Stack-Cube-NoBlue-Franka-IK-Rel-Visuomotor-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.stack_ik_rel_visuomotor_no_blue_env_cfg:FrankaCubeStackVisuomotorNoBlueEnvCfg"
+        ),
+        "robomimic_bc_cfg_entry_point": f"{agents.__name__}:robomimic/bc_rnn_image_200.json",
+    },
+    disable_env_checker=True,
+)
+
 gym.register(
     id="Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Cosmos-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
