@@ -41,6 +41,17 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+gym.register(
+    id="Isaac-Stack-Cube-Yellow-Franka-IK-Rel-Visuomotor-Mimic-v0",
+    entry_point=f"{__name__}.franka_stack_ik_rel_mimic_env:FrankaCubeStackIKRelMimicEnv",
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.franka_stack_ik_rel_visuomotor_yellow_mimic_env_cfg:FrankaCubeStackYellowIKRelVisuomotorMimicEnvCfg"
+        ),
+    },
+    disable_env_checker=True,
+)
 ###########
 
 gym.register(
