@@ -35,8 +35,12 @@ gym.register(
     id="Isaac-Stack-Cube-BlueGreenRed-Franka-IK-Rel-Visuomotor-Mimic-v0",
     entry_point=f"{__name__}.franka_stack_ik_rel_mimic_env:FrankaCubeStackIKRelMimicEnv",
     kwargs={
+        # Was FrankaCubeStackIKRelVisuomotorMimicEnvCfg - i.e. the SAME cfg as the in-distribution
+        # Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Mimic-v0, so this id was a no-op alias and
+        # generating with it produced in-distribution data under an OOD name.
         "env_cfg_entry_point": (
-            f"{__name__}.franka_stack_ik_rel_visuomotor_mimic_env_cfg:FrankaCubeStackIKRelVisuomotorMimicEnvCfg"
+            f"{__name__}.franka_stack_ik_rel_visuomotor_bluegreenred_mimic_env_cfg:"
+            "FrankaCubeStackBlueGreenRedIKRelVisuomotorMimicEnvCfg"
         ),
     },
     disable_env_checker=True,

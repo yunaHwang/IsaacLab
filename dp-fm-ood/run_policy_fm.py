@@ -21,8 +21,9 @@ Args:
     num_rollouts: Number of rollouts to run.
     seed: Random seed.
 
-CURRENT MODE: the executed action is the SpaceMouse, not the policy. The run_multitask_ditpolicy() call
-is commented out in main(); run_spacemouse_teleop() steps the env with the SpaceMouse command and sends
+CURRENT MODE: the executed action is the policy's. main() calls run_multitask_ditpolicy(), which steps
+the env with the server's action and no longer reads the SpaceMouse (its advance() is commented out).
+The run_spacemouse_teleop() call is commented out in main(); when re-enabled, run_spacemouse_teleop() steps the env with the SpaceMouse command and sends
 each (obs, command) to multitask_dit_server.py's "score_action", which scores it with the same
 multitask_dit_loss as state_ood_loss and, when started with --ood_csv, writes the row (loss in the
 state_ood_loss column, normalized command in raw_action_*, physical command in physical_action_*).
@@ -458,9 +459,10 @@ def run_multitask_ditpolicy(
         # Purely for visibility/logging - not blocking, not capped, and not blended into
         # the executed action (no blend rule is implemented yet - see TODO in
         # run_dp_policy/run_gloves_policy's identical not_blend=False gap).
-        if teleop_interface is not None:
-            user_action = teleop_interface.advance()
-            print(f"[SpaceMouse] raw 7-DoF action: {user_action.tolist()}")
+        # SpaceMouse read disabled - the policy's action alone drives env.step below.
+        # if teleop_interface is not None:
+        #     user_action = teleop_interface.advance()
+        #     print(f"[SpaceMouse] raw 7-DoF action: {user_action.tolist()}")
 
         obs_dict, _, terminated, truncated, _ = env.step(policy_actions)
 
@@ -634,8 +636,9 @@ def main():
     # SpaceMouse-driven rollouts need the device regardless of --blend (was: only created when
     # blending was requested).
     teleop_interface = None
-    # if not not_blend:
-    if True:
+    # Policy-driven rollout (current mode) never reads the SpaceMouse, so only open it for --blend.
+    # Change back to `if True:` when re-enabling run_spacemouse_teleop() below - it needs the device.
+    if not not_blend:
         cfg = Se3SpaceMouseCfg(sim_device=device)
         # --spacemouse picks the device explicitly. Several identical SpaceMouse Compacts are plugged
         # into this workstation, and Isaac Lab's Se3SpaceMouse(cfg) opens an arbitrary one of them
@@ -700,34 +703,35 @@ def main():
         for trial in range(args_cli.num_rollouts):
             print(f"[INFO] Starting trial {trial}")
 
-            # POLICY-DRIVEN ROLLOUT (commented out - the SpaceMouse drives below, the server only scores).
-            # terminated, traj = run_multitask_ditpolicy(
-            #     conn=conn,
-            #     env=env,
-            #     success_term=success_term,
-            #     horizon=args_cli.horizon,
-            #     device=device,
-            #     task_instruction=args_cli.task_instruction,
-            #     teleop_interface=teleop_interface,
-            #     state_mode=args_cli.state_mode,
-            #     checkpoint=args_cli.fm_checkpoint,
-            #     seed=args_cli.seed,
-            #     trial=trial,
-            # )
-            terminated, traj = run_spacemouse_teleop(
+            # POLICY-DRIVEN ROLLOUT: the policy's action chunk steps the env; the SpaceMouse is not read.
+            terminated, traj = run_multitask_ditpolicy(
                 conn=conn,
                 env=env,
                 success_term=success_term,
                 horizon=args_cli.horizon,
+                device=device,
                 task_instruction=args_cli.task_instruction,
                 teleop_interface=teleop_interface,
                 state_mode=args_cli.state_mode,
                 checkpoint=args_cli.fm_checkpoint,
                 seed=args_cli.seed,
                 trial=trial,
-                score_density=args_cli.score_density,
-                live_plot=live_plot,
             )
+            # SPACEMOUSE-DRIVEN ROLLOUT (commented out - the policy drives above).
+            # terminated, traj = run_spacemouse_teleop(
+            #     conn=conn,
+            #     env=env,
+            #     success_term=success_term,
+            #     horizon=args_cli.horizon,
+            #     task_instruction=args_cli.task_instruction,
+            #     teleop_interface=teleop_interface,
+            #     state_mode=args_cli.state_mode,
+            #     checkpoint=args_cli.fm_checkpoint,
+            #     seed=args_cli.seed,
+            #     trial=trial,
+            #     score_density=args_cli.score_density,
+            #     live_plot=live_plot,
+            # )
 
             results.append(terminated)
             print(f"[INFO] Trial {trial}: {terminated}\n")
