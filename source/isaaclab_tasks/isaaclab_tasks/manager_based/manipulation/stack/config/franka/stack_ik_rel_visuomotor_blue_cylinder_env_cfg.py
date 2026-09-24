@@ -3,22 +3,45 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-# added! Yuna - Rel-Visuomotor stack env with an extra blue cylinder (blue_cylinder) as a distractor.
-# Same color/texture as the blue cube (cube_1), different shape. Like the yellow block, it is not
-# referenced by any subtask, success, termination or state observation term; it only shows up in the
-# camera images and in the recorded states / datagen_info.
+"""Rel-Visuomotor stack env whose stack BASE is a blue cylinder instead of the blue cube.
+
+added! Yuna. The scene is the ID scene plus ``blue_cylinder``: same colour and texture as the blue
+cube (cube_1), different shape. It began as a pure visual distractor, referenced by no subtask,
+success or termination term. It is now the OBJECT THE STACK IS BUILT ON, which is what makes this
+task distinct from the ID one:
+
+    ID   : grasp red (cube_2) -> stack on blue CUBE (cube_1)     -> grasp green (cube_3) -> stack on red
+    here : grasp red (cube_2) -> stack on blue CYLINDER          -> grasp green (cube_3) -> stack on red
+
+The blue cube (cube_1) stays in the scene and becomes the distractor - the mirror of the old setup.
+A policy trained on ID has to tell the two blue objects apart by shape, which is the point.
+
+WHY THIS FILE DEFINES ITS OWN SUBTASK + SUCCESS TERMS
+-----------------------------------------------------
+``stack_ik_rel_visuomotor_env_cfg.ObservationsCfg.SubtaskCfg`` and ``mdp.cubes_stacked`` are shared
+with the ID task and are toggled by hand between stacking orders (both files carry commented-out
+alternatives). Inheriting them would mean this env's goal silently follows whatever the ID files were
+last toggled to - and they cannot express "stack on the cylinder" at all, since they name cube_1.
+So the two terms that define the goal are written out explicitly below, the same way
+``stack_ik_rel_visuomotor_bluegreenred_env_cfg.py`` does it for the OOD ordering."""
 
 from collections.abc import Callable
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sim.utils import get_current_stage
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from pxr import Gf, Sdf, Usd, UsdShade
 
+from isaaclab_tasks.manager_based.manipulation.stack import mdp
+
 from .stack_ik_rel_visuomotor_env_cfg import FrankaCubeStackVisuomotorEnvCfg
+from .stack_ik_rel_visuomotor_env_cfg import ObservationsCfg as IDObservationsCfg
 
 # OmniPBR materials used by the Nucleus blocks (texture * tint): /Looks/{Red,Green,Blue,Yellow}
 BLOCK_MATERIALS_USD = f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/Materials/Materials.usd"
@@ -87,10 +110,93 @@ def add_blue_cylinder(cfg):
     ]
 
 
+def use_blue_cylinder_as_base(cfg):
+    """Point the success + dropping terminations at the cylinder. Call after ``add_blue_cylinder``.
+
+    Kept as a function so the plain env cfg and the mimic env cfg apply exactly the same terms;
+    duplicating them is how the two drifted apart on the BlueGreenRed task.
+    """
+    # Same stacking maths as the ID task, with the cylinder substituted for the bottom object.
+    # cubes_stacked() only reads root_pos_w of whatever entities it is handed, so a cylinder works
+    # as cube_1_cfg; its height (0.047 m) equals the block height the default height_diff assumes.
+    cfg.terminations.success = DoneTerm(
+        func=mdp.cubes_stacked,
+        params={
+            "cube_1_cfg": SceneEntityCfg("blue_cylinder"),  # bottom: the CYLINDER, not cube_1
+            "cube_2_cfg": SceneEntityCfg("cube_2"),  # middle: red
+            "cube_3_cfg": SceneEntityCfg("cube_3"),  # top: green
+        },
+    )
+    # The base of the stack falling off the table is unrecoverable, so end the episode - the same
+    # guard cube_1 gets in StackEnvCfg.TerminationsCfg, which no longer covers the base object here.
+    cfg.terminations.blue_cylinder_dropping = DoneTerm(
+        func=mdp.root_height_below_minimum,
+        params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg("blue_cylinder")},
+    )
+
+
+@configclass
+class BlueCylinderObservationsCfg(IDObservationsCfg):
+    """ID visuomotor observations with the subtask group rebased on the cylinder.
+
+    Subclassing keeps PolicyCfg - both cameras, their resolution, every state term - byte-for-byte
+    identical to the training distribution. Only ``subtask_terms`` changes, so an ID-vs-this
+    comparison differs in the goal object alone.
+    """
+
+    @configclass
+    class SubtaskCfg(ObsGroup):
+        """Signals for: grasp red -> stack red on the blue CYLINDER -> grasp green (-> stack on red).
+
+        The names stay grasp_1 / stack_1 / grasp_2 because they are looked up by string in three
+        places that must agree: the mimic cfg's ``subtask_term_signal`` values, and
+        ``FrankaCubeStackIKRelMimicEnv.get_subtask_term_signals`` which reads exactly these three
+        keys. Only the objects they refer to differ from ID.
+        """
+
+        grasp_1 = ObsTerm(
+            func=mdp.object_grasped,
+            params={
+                "robot_cfg": SceneEntityCfg("robot"),
+                "ee_frame_cfg": SceneEntityCfg("ee_frame"),
+                "object_cfg": SceneEntityCfg("cube_2"),  # red - same as ID
+            },
+        )
+        stack_1 = ObsTerm(
+            func=mdp.object_stacked,
+            params={
+                "robot_cfg": SceneEntityCfg("robot"),
+                "upper_object_cfg": SceneEntityCfg("cube_2"),  # red
+                "lower_object_cfg": SceneEntityCfg("blue_cylinder"),  # THE CHANGE: was cube_1
+            },
+        )
+        grasp_2 = ObsTerm(
+            func=mdp.object_grasped,
+            params={
+                "robot_cfg": SceneEntityCfg("robot"),
+                "ee_frame_cfg": SceneEntityCfg("ee_frame"),
+                "object_cfg": SceneEntityCfg("cube_3"),  # green - same as ID
+            },
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = False
+
+    subtask_terms: SubtaskCfg = SubtaskCfg()
+
+
 @configclass
 class FrankaCubeStackVisuomotorBlueCylinderEnvCfg(FrankaCubeStackVisuomotorEnvCfg):
+    """Franka cube stack, cameras on, stacked on the blue cylinder instead of the blue cube."""
+
+    observations: BlueCylinderObservationsCfg = BlueCylinderObservationsCfg()
+
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
 
         add_blue_cylinder(self)
+        # terminations come from StackEnvCfg and are untouched by the visuomotor cfg, so without
+        # this the env would render a cylinder-based scene while still scoring the ID cube stack.
+        use_blue_cylinder_as_base(self)
