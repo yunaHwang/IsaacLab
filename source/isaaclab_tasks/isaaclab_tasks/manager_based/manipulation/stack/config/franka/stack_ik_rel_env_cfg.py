@@ -240,5 +240,12 @@ class FrankaCubeStackBlueGreenRedEnvCfg(FrankaCubeStackEnvCfg):
                 apply_noise_during_interpolation=False,
             )
         )
-        self.subtask_configs["franka"] = subtask_configs
+        # `subtask_configs` only exists when MimicEnvCfg is mixed in, which happens on the
+        # *-Mimic-v0 registrations. This class descends from FrankaCubeStackEnvCfg alone, so for the
+        # plain Isaac-Stack-Cube-BlueGreenRed-Franka-IK-Rel-v0 env (a ManagerBasedRLEnv, used by
+        # record_demos.py for teleop) the attribute is absent and setting it unconditionally made
+        # that env fail to parse with "object has no attribute 'subtask_configs'". The configs are
+        # kept here for any Mimic subclass that does mix it in.
+        if hasattr(self, "subtask_configs"):
+            self.subtask_configs["franka"] = subtask_configs
 

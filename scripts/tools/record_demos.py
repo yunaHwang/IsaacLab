@@ -45,6 +45,25 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--spacemouse",
+    type=str,
+    default="auto",
+    help=(
+        "With --teleop_device spacemouse: which SpaceMouse drives the robot. A local HID path like"
+        " /dev/hidraw5 (find yours with `python dp-fm-ood/spacemouse_identify.py`), 'bridge' for"
+        " spacemouse_bridge.py over the network, or 'auto' (the one local SpaceMouse if exactly one is"
+        " connected, the bridge if none, and an error listing them if several are). Isaac Lab's own"
+        " lookup silently opens an arbitrary one of identical devices, which then reads all zeros."
+    ),
+)
+parser.add_argument(
+    "--spacemouse_bridge_host", type=str, default="127.0.0.1", help="Host spacemouse_bridge.py is listening on."
+)
+parser.add_argument("--spacemouse_bridge_port", type=int, default=6060, help="Port spacemouse_bridge.py listens on.")
+parser.add_argument(
+    "--spacemouse_bridge_authkey", type=str, default="spacemouse-ipc", help="Must match spacemouse_bridge.py --authkey."
+)
+parser.add_argument(
     "--dataset_file", type=str, default="./datasets/dataset.hdf5", help="File path to export recorded demos."
 )
 parser.add_argument("--step_hz", type=int, default=30, help="Environment stepping rate in Hz.")
@@ -93,7 +112,12 @@ simulation_app = app_launcher.app
 # Third-party imports
 import logging
 import os
+import sys
 import time
+
+# Repo root (<root>/scripts/tools/record_demos.py -> <root>), used to reach dp-fm-ood/ for the
+# SpaceMouse selection helpers. Derived from __file__ so it follows the checkout, not the cwd.
+ISAACLAB_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import gymnasium as gym
 import torch
@@ -291,7 +315,22 @@ def setup_teleop_device(callbacks: dict[str, Callable]) -> object:
             if args_cli.teleop_device.lower() == "keyboard":
                 teleop_interface = Se3Keyboard(Se3KeyboardCfg(pos_sensitivity=0.2, rot_sensitivity=0.5))
             elif args_cli.teleop_device.lower() == "spacemouse":
-                teleop_interface = Se3SpaceMouse(Se3SpaceMouseCfg(pos_sensitivity=0.2, rot_sensitivity=0.5))
+                # Not plain Se3SpaceMouse(cfg): it finds the device by vendor/product id, and the
+                # identical SpaceMouse Compacts on this workstation share both and report no serial,
+                # so it opens an arbitrary one - which then reads all zeros with no error. Imported
+                # here rather than at module top level because it pulls in isaaclab.devices, which
+                # only exists once AppLauncher has started the simulator above.
+                sys.path.insert(0, os.path.join(ISAACLAB_ROOT, "dp-fm-ood"))
+                from spacemouse_select import make_spacemouse
+
+                teleop_interface = make_spacemouse(
+                    Se3SpaceMouseCfg(pos_sensitivity=0.2, rot_sensitivity=0.5),
+                    choice=args_cli.spacemouse,
+                    bridge_host=args_cli.spacemouse_bridge_host,
+                    bridge_port=args_cli.spacemouse_bridge_port,
+                    bridge_authkey=args_cli.spacemouse_bridge_authkey,
+                )
+                print(teleop_interface)
             else:
                 logger.error(f"Unsupported teleop device: {args_cli.teleop_device}")
                 logger.error("Supported devices: keyboard, spacemouse, handtracking")
